@@ -1,6 +1,7 @@
 import base64
 
 from app.ui.dash_app import (
+    _channel_bulk_category_dropdown_state,
     _dedupe_group_selection_state,
     _dedupe_select_group_rows,
     create_dash_app,
@@ -56,6 +57,7 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "channel-bulk-action" in layout_repr
     assert "channel-bulk-sales-channel-id" in layout_repr
     assert "channel-bulk-channel-category-id" in layout_repr
+    assert "channel-bulk-category-status" in layout_repr
     assert "product-select-all-button" in layout_repr
     assert "product-select-filtered-button" in layout_repr
     assert "product-select-page-button" in layout_repr
@@ -191,6 +193,46 @@ def test_dedupe_group_select_marks_all_products() -> None:
 
     assert [row["product_id"] for row in selected] == [1, 2]
     assert _dedupe_group_selection_state(group_rows, selected) == "all"
+
+
+def test_channel_bulk_category_dropdown_filters_selected_channel() -> None:
+    snapshot = {
+        "sales_channels": [{"id": 1, "code": "voxster", "name": "voxster.ch"}],
+        "channel_category_options": [
+            {"label": "voxster · Reiniger · 10", "value": 10, "sales_channel_id": "1"},
+            {"label": "other · Archiv · 20", "value": 20, "sales_channel_id": 2},
+        ],
+    }
+
+    options, value, disabled, message = _channel_bulk_category_dropdown_state(1, snapshot)
+
+    assert options == [{"label": "voxster · Reiniger · 10", "value": 10, "sales_channel_id": "1"}]
+    assert value is None
+    assert disabled is False
+    assert "1 Kanal-Kategorien verfügbar" in message
+
+
+def test_channel_bulk_category_dropdown_reports_empty_channel() -> None:
+    snapshot = {
+        "sales_channels": [{"id": 1, "code": "voxster", "name": "voxster.ch"}],
+        "channel_category_options": [],
+    }
+
+    options, value, disabled, message = _channel_bulk_category_dropdown_state(1, snapshot)
+
+    assert options == []
+    assert value is None
+    assert disabled is True
+    assert "Keine Kanal-Kategorien für voxster.ch (voxster) gefunden" in message
+
+
+def test_channel_bulk_category_dropdown_handles_invalid_channel_id() -> None:
+    options, value, disabled, message = _channel_bulk_category_dropdown_state("bad", {})
+
+    assert options == []
+    assert value is None
+    assert disabled is True
+    assert "ungültige Vertriebskanal-ID" in message
 
 
 def test_dedupe_group_deselect_removes_only_group_products() -> None:

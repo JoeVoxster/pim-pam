@@ -44,6 +44,76 @@ from app.utils.pim_config import get_pim_settings
 
 LOGGER = logging.getLogger(__name__)
 
+GPT_CHEMICAL_ENRICHMENT_MODEL_ENV = "OPENAI_CHEMICAL_ENRICHMENT_MODEL"
+GPT_CHEMICAL_GENERAL_FIELDS = (
+    "chemical_type",
+    "ufi",
+    "voc_content_percent",
+    "cas_number",
+    "ec_number",
+    "un_number",
+    "hazard_class",
+    "packing_group",
+    "ghs_pictograms",
+    "signal_word",
+    "hazard_statements",
+    "precautionary_statements",
+    "wgk",
+    "storage_class",
+    "sds_url",
+    "density",
+    "color",
+    "odor",
+    "ph_value",
+    "flash_point",
+    "boiling_point",
+    "viscosity",
+    "solubility",
+    "limited_quantity",
+    "hazard_shipping_note",
+)
+GPT_REGULATORY_FIELDS = {
+    "ufi",
+    "un_number",
+    "hazard_class",
+    "packing_group",
+    "ghs_pictograms",
+    "signal_word",
+    "hazard_statements",
+    "precautionary_statements",
+    "wgk",
+    "storage_class",
+    "limited_quantity",
+    "hazard_shipping_note",
+    "voc_content_percent",
+}
+GPT_TECHNICAL_FALLBACK_FIELDS = {
+    "ufi",
+    "voc_content_percent",
+    "cas_number",
+    "ec_number",
+    "un_number",
+    "hazard_class",
+    "packing_group",
+    "ghs_pictograms",
+    "hazard_statements",
+    "precautionary_statements",
+    "wgk",
+    "storage_class",
+    "sds_url",
+    "density",
+    "ph_value",
+    "flash_point",
+    "boiling_point",
+    "viscosity",
+    "solubility",
+    "limited_quantity",
+}
+GPT_APPLY_ACTIONS = {"apply", "uebernehmen", "übernehmen"}
+GPT_IGNORE_ACTIONS = {"ignore", "ignorieren"}
+GPT_REVIEW_ACTIONS = {"manual_review", "manuell_pruefen", "manuell prüfen", "review"}
+GPT_APPLY_STATUSES = {"suggested", "reviewed", "corrected", "needs_review"}
+
 def list_product_chemical_enrichment_runs(session: Session, product_id: int) -> list[dict]:
     stmt = (
         select(ProductChemicalEnrichment)
@@ -113,6 +183,520 @@ def get_latest_product_chemical_enrichment(session: Session, product_id: int) ->
         "extracted_at": enrichment.extracted_at.isoformat() if enrichment.extracted_at else None,
         "applied_at": enrichment.applied_at.isoformat() if enrichment.applied_at else None,
     }
+
+
+def get_chemical_gpt_enrichment_config_status() -> dict[str, object]:
+    model = (
+        os.getenv(GPT_CHEMICAL_ENRICHMENT_MODEL_ENV)
+        or os.getenv("OPENAI_MODEL")
+        or "gpt-5.5"
+    ).strip()
+    api_key_present = bool(str(os.getenv("OPENAI_API_KEY") or "").strip())
+    return {
+        "enabled": bool(model and api_key_present),
+        "provider": "openai",
+        "model": model,
+        "api_key_present": api_key_present,
+        "missing": [] if api_key_present else ["OPENAI_API_KEY"],
+    }
+
+
+def run_product_chemical_gpt_completion(
+    session: Session,
+    product_id: int,
+    enrichment_id: int | None = None,
+) -> dict[str, object]:
+    return _run_product_chemical_gpt_workflow(
+        session,
+        product_id,
+        enrichment_id=enrichment_id,
+        mode="completion",
+    )
+
+
+def review_product_chemical_gpt_suggestions(
+    session: Session,
+    product_id: int,
+    enrichment_id: int | None = None,
+) -> dict[str, object]:
+    return _run_product_chemical_gpt_workflow(
+        session,
+        product_id,
+        enrichment_id=enrichment_id,
+        mode="review",
+    )
+
+
+def _run_product_chemical_gpt_workflow(
+    session: Session,
+    product_id: int,
+    *,
+    enrichment_id: int | None,
+    mode: str,
+) -> dict[str, object]:
+    product = session.scalar(
+        select(Product)
+        .options(joinedload(Product.brand), joinedload(Product.assets), joinedload(Product.sdb_record))
+        .where(Product.id == product_id)
+    )
+    if product is None:
+        raise ValueError("Chemieprodukt nicht gefunden")
+    latest = _resolve_product_chemical_enrichment(session, product_id, enrichment_id)
+    config = get_chemical_gpt_enrichment_config_status()
+    current_suggestions = _existing_enrichment_suggestions(latest)
+    context = _build_gpt_chemical_context(product, latest, current_suggestions)
+
+    if not config["api_key_present"]:
+        suggestions = _build_gpt_fallback_suggestions(product, mode=mode, existing_suggestions=current_suggestions)
+        return _store_gpt_enrichment_result(
+            session,
+            product,
+            latest,
+            mode=mode,
+            status="missing_api_key",
+            model=str(config.get("model") or ""),
+            suggestions=suggestions,
+            warnings=["OPENAI_API_KEY fehlt; deterministische Fallback-Vorschläge erzeugt."],
+            log=[
+                "GPT-Konfiguration geprüft.",
+                "OPENAI_API_KEY fehlt.",
+                f"{len(suggestions)} Fallback-Vorschläge erzeugt.",
+            ],
+            raw_payload={"config": {"provider": "openai", "model": config.get("model"), "api_key_present": False}},
+        )
+
+    try:
+        response = _call_openai_chemical_json(
+            system_prompt=_chemical_gpt_system_prompt(mode),
+            user_payload=context,
+            model=str(config.get("model") or "gpt-5.5"),
+        )
+    except Exception as exc:
+        LOGGER.warning("Chemical GPT %s failed for product %s: %s", mode, product_id, exc)
+        suggestions = _build_gpt_fallback_suggestions(product, mode=mode, existing_suggestions=current_suggestions)
+        return _store_gpt_enrichment_result(
+            session,
+            product,
+            latest,
+            mode=mode,
+            status="failed",
+            model=str(config.get("model") or ""),
+            suggestions=suggestions,
+            warnings=[f"GPT-Aufruf fehlgeschlagen: {exc}"],
+            log=[
+                "GPT-Konfiguration geprüft.",
+                f"GPT-{mode} fehlgeschlagen.",
+                f"{len(suggestions)} Fallback-Vorschläge erzeugt.",
+            ],
+            raw_payload={"error": str(exc), "config": {"provider": "openai", "model": config.get("model")}},
+            error_log=str(exc),
+        )
+
+    suggestions = _normalize_gpt_suggestions(product, response.get("suggestions") if isinstance(response, dict) else None, mode=mode)
+    if not suggestions:
+        suggestions = _build_gpt_fallback_suggestions(product, mode=mode, existing_suggestions=current_suggestions)
+    warnings = _unique_strings((response.get("warnings") if isinstance(response, dict) else []) or [])
+    status = "needs_review" if suggestions else "no_suggestions"
+    return _store_gpt_enrichment_result(
+        session,
+        product,
+        latest,
+        mode=mode,
+        status=status,
+        model=str(config.get("model") or ""),
+        suggestions=suggestions,
+        warnings=warnings,
+        log=[
+            "GPT-Konfiguration geprüft.",
+            f"GPT-{mode} abgeschlossen.",
+            f"{len(suggestions)} Vorschläge erzeugt.",
+            f"{sum(1 for item in suggestions if _is_review_required(item))} prüfpflichtig.",
+        ],
+        raw_payload={"response": response, "config": {"provider": "openai", "model": config.get("model")}},
+    )
+
+
+def _resolve_product_chemical_enrichment(
+    session: Session,
+    product_id: int,
+    enrichment_id: int | None,
+) -> ProductChemicalEnrichment | None:
+    if enrichment_id is not None:
+        return session.scalar(
+            select(ProductChemicalEnrichment).where(
+                ProductChemicalEnrichment.product_id == product_id,
+                ProductChemicalEnrichment.id == enrichment_id,
+            )
+        )
+    latest = session.scalar(
+        select(ProductChemicalEnrichment)
+        .where(ProductChemicalEnrichment.product_id == product_id)
+        .order_by(ProductChemicalEnrichment.extracted_at.desc(), ProductChemicalEnrichment.id.desc())
+    )
+    if latest is not None and not _enrichment_has_suggestions(latest):
+        suggested = _latest_enrichment_with_suggestions(session, product_id)
+        if suggested is not None:
+            return suggested
+    return latest
+
+
+def _store_gpt_enrichment_result(
+    session: Session,
+    product: Product,
+    latest: ProductChemicalEnrichment | None,
+    *,
+    mode: str,
+    status: str,
+    model: str,
+    suggestions: list[dict[str, object]],
+    warnings: list[str],
+    log: list[str],
+    raw_payload: dict[str, object],
+    error_log: str | None = None,
+) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    source_kind = f"gpt_{mode}"
+    reference_url = product.chemical_reference_url or product.sds_url or (latest.reference_url if latest else None)
+    documents = list((latest.document_links_json if latest else []) or [])
+    normalized = {
+        "fields": {},
+        "enrichment": {
+            "status": status,
+            "mode": f"gpt_{mode}",
+            "provider": "openai",
+            "model": model,
+            "last_run_at": now.isoformat(),
+            "suggestions": suggestions,
+            "sources": _gpt_sources_from_context(product, latest),
+            "warnings": warnings,
+            "log": log,
+            "progress": {
+                "checked_fields": len(GPT_CHEMICAL_GENERAL_FIELDS),
+                "suggestion_count": len(suggestions),
+                "review_required_count": sum(1 for item in suggestions if _is_review_required(item)),
+                "error_count": 1 if error_log or status in {"failed", "missing_api_key"} else 0,
+                "last_error_message": error_log or (warnings[0] if status == "missing_api_key" and warnings else None),
+            },
+        },
+    }
+    enrichment = ProductChemicalEnrichment(
+        product_id=product.id,
+        reference_url=reference_url,
+        source_kind=source_kind,
+        status=status,
+        raw_payload_json=raw_payload,
+        normalized_payload_json=normalized,
+        document_links_json=documents,
+        warnings_json=warnings,
+        error_log=error_log,
+        extracted_at=now,
+    )
+    session.add(enrichment)
+    product.chemical_last_enriched_at = now
+    product.chemical_enrichment_status = status
+    product.chemical_enrichment_error = error_log
+    session.flush()
+    return {
+        "status": status,
+        "enrichment_id": enrichment.id,
+        "suggestions": suggestions,
+        "suggestion_count": len(suggestions),
+        "review_required_count": normalized["enrichment"]["progress"]["review_required_count"],
+        "warnings": warnings,
+        "error": error_log,
+        "model": model,
+    }
+
+
+def _build_gpt_chemical_context(
+    product: Product,
+    latest: ProductChemicalEnrichment | None,
+    current_suggestions: list[dict[str, object]],
+) -> dict[str, object]:
+    latest_payload = (latest.normalized_payload_json if latest else {}) or {}
+    latest_enrichment = latest_payload.get("enrichment") if isinstance(latest_payload, dict) else {}
+    sdb_record = product.sdb_record
+    sdb_sections: dict[str, object] = {}
+    if sdb_record and isinstance(sdb_record.sections_json, dict):
+        for key in ("section_1", "section_2", "section_7", "section_9", "section_14", "section_15", "section_16"):
+            section = sdb_record.sections_json.get(key) or {}
+            if isinstance(section, dict):
+                sdb_sections[key] = {
+                    "title": section.get("title"),
+                    "content_excerpt": _compact_excerpt(section.get("content"), 900),
+                }
+    return {
+        "product": {
+            "id": product.id,
+            "sku": product.sku,
+            "title": product.title,
+            "brand": product.brand.name if product.brand else None,
+            "description_excerpt": _compact_excerpt(product.description),
+            "general_fields": {field: _current_product_value(product, field) for field in GPT_CHEMICAL_GENERAL_FIELDS},
+        },
+        "internet": {
+            "reference_url": latest.reference_url if latest else product.chemical_reference_url,
+            "source_kind": latest.source_kind if latest else None,
+            "documents": (latest.document_links_json if latest else []) or [],
+            "warnings": (latest.warnings_json if latest else []) or [],
+            "existing_suggestions": current_suggestions,
+            "latest_status": latest.status if latest else None,
+            "latest_sources": (latest_enrichment or {}).get("sources") if isinstance(latest_enrichment, dict) else [],
+        },
+        "sdb": {
+            "source_url": sdb_record.source_url if sdb_record else None,
+            "pdf_url": sdb_record.pdf_url if sdb_record else None,
+            "parser_status": sdb_record.parser_status if sdb_record else None,
+            "review_status": sdb_record.review_status if sdb_record else None,
+            "sections": sdb_sections,
+            "raw_text_excerpt": _compact_excerpt(sdb_record.raw_text, 1200) if sdb_record else None,
+        },
+        "rules": {
+            "missing_german_text": "Nicht bekannt",
+            "missing_technical": "n.a.",
+            "regulatory_fields_require_source_or_review": sorted(GPT_REGULATORY_FIELDS),
+            "do_not_overwrite_current_values": True,
+        },
+    }
+
+
+def _existing_enrichment_suggestions(enrichment: ProductChemicalEnrichment | None) -> list[dict[str, object]]:
+    review = ((enrichment.normalized_payload_json if enrichment else {}) or {}).get("enrichment") or {}
+    suggestions = review.get("suggestions") if isinstance(review, dict) else []
+    return [item for item in suggestions if isinstance(item, dict)] if isinstance(suggestions, list) else []
+
+
+def _gpt_sources_from_context(product: Product, latest: ProductChemicalEnrichment | None) -> list[dict[str, object]]:
+    sources: list[dict[str, object]] = []
+    for value, label in (
+        (product.sds_url, "SDB URL"),
+        (product.chemical_reference_url, "Chemie-Referenz"),
+        (product.source_url_final, "Produkt-URL final"),
+        (product.source_url, "Produkt-URL"),
+        ((latest.reference_url if latest else None), "Letzte Anreicherung"),
+    ):
+        if str(value or "").strip():
+            sources.append({"label": label, "url": str(value).strip()})
+    return sources
+
+
+def _chemical_gpt_system_prompt(mode: str) -> str:
+    purpose = "fehlende Felder aus dem Reiter Allgemein ergänzen" if mode == "completion" else "vorhandene Vorschläge prüfen, plausibilisieren und korrigieren"
+    return (
+        "Du bist ein vorsichtiger PIM/PAM-Assistent für Chemieprodukte. "
+        f"Aufgabe: {purpose}. Antworte ausschließlich als JSON-Objekt mit den Schlüsseln "
+        "'suggestions' und optional 'warnings'. Jede suggestion braucht field, suggested_value, "
+        "source, confidence, status, action und reason. Erfinde keine regulatorischen Fakten. "
+        "SDB/ADR/WGK/Lagerklasse/GHS/UN/UFI/VOC/SUVA-relevante Angaben ohne belastbare Quelle "
+        "müssen als prüfpflichtig markiert werden. Unbekannte deutsche Textwerte sind 'Nicht bekannt', "
+        "technische/normierte unbekannte Werte sind 'n.a.'. Überschreibe keine bestehenden Werte direkt."
+    )
+
+
+def _call_openai_chemical_json(
+    *,
+    system_prompt: str,
+    user_payload: dict[str, object],
+    model: str,
+) -> dict[str, object]:
+    api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY fehlt")
+    base_url = str(os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    timeout = float(os.getenv("OPENAI_TIMEOUT_SECONDS") or "60")
+    body: dict[str, object] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(user_payload, ensure_ascii=False, default=str),
+            },
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    if not model.lower().startswith("gpt-5"):
+        body["temperature"] = 0.1
+    response = requests.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=body,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Leere GPT-Antwort")
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Ungueltige GPT-JSON-Antwort: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("GPT-Antwort ist kein JSON-Objekt")
+    return parsed
+
+
+def _normalize_gpt_suggestions(
+    product: Product,
+    suggestions: object,
+    *,
+    mode: str,
+) -> list[dict[str, object]]:
+    if not isinstance(suggestions, list):
+        return []
+    normalized: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in suggestions:
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field") or "").strip()
+        if field not in CHEMICAL_FIELD_NAMES and not field.startswith("chem_safety."):
+            continue
+        if field in seen:
+            continue
+        seen.add(field)
+        value = item.get("suggested_value")
+        if value is None and "value" in item:
+            value = item.get("value")
+        current_value = _current_product_value(product, field)
+        status = _normalize_gpt_status(str(item.get("status") or ""), field, item)
+        action = _normalize_gpt_action(str(item.get("action") or ""), status, field)
+        confidence = _normalize_gpt_confidence(item.get("confidence"), status=status)
+        source = str(item.get("source") or item.get("source_url") or "GPT")
+        reason = str(item.get("reason") or item.get("evidence") or item.get("explanation") or "")
+        if _is_blank_value(value):
+            value = _fallback_value_for_field(field)
+            status = "not_known" if field not in GPT_REGULATORY_FIELDS else "needs_review"
+            action = "manual_review"
+            confidence = min(confidence, 0.2)
+            reason = reason or "Keine belastbare Information gefunden."
+        if field in GPT_REGULATORY_FIELDS and not _has_source_hint(source, reason):
+            status = "needs_review" if status in {"suggested", "reviewed", "corrected"} else status
+            action = "manual_review" if action == "apply" else action
+            reason = (reason + " " if reason else "") + "Regulatorische Angabe ohne belastbare Quelle; prüfpflichtig."
+        normalized.append(
+            {
+                "field": field,
+                "current_value": current_value,
+                "found_value": item.get("found_value"),
+                "internet_value": item.get("internet_value"),
+                "suggested_value": value,
+                "gpt_value": value,
+                "confidence": confidence,
+                "source": source,
+                "source_url": item.get("source_url"),
+                "source_section": item.get("source_section"),
+                "evidence": _compact_excerpt(reason),
+                "gpt_reason": _compact_excerpt(reason),
+                "status": status,
+                "action": action,
+                "mode": f"gpt_{mode}",
+            }
+        )
+    return normalized
+
+
+def _build_gpt_fallback_suggestions(
+    product: Product,
+    *,
+    mode: str,
+    existing_suggestions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    source_by_field = {str(item.get("field") or ""): item for item in existing_suggestions if isinstance(item, dict)}
+    suggestions: list[dict[str, object]] = []
+    for field in GPT_CHEMICAL_GENERAL_FIELDS:
+        current_value = _current_product_value(product, field)
+        if not _is_blank_value(current_value):
+            continue
+        existing = source_by_field.get(field) or {}
+        value = existing.get("suggested_value")
+        has_existing_value = not _is_blank_value(value)
+        if not has_existing_value:
+            value = _fallback_value_for_field(field)
+        status = "needs_review" if field in GPT_REGULATORY_FIELDS else ("suggested" if has_existing_value else "not_known")
+        action = "manual_review" if status in {"needs_review", "not_known"} else "apply"
+        reason = existing.get("evidence") or existing.get("gpt_reason") or "Keine belastbare Quelle gefunden."
+        if field in GPT_REGULATORY_FIELDS:
+            reason = f"{reason} Prüfflichtig, weil chemisch/regulatorisch relevant."
+        suggestions.append(
+            {
+                "field": field,
+                "current_value": current_value,
+                "found_value": existing.get("found_value"),
+                "internet_value": existing.get("suggested_value"),
+                "suggested_value": value,
+                "gpt_value": value,
+                "confidence": 0.65 if has_existing_value else 0.1,
+                "source": existing.get("source") or "Fallback",
+                "source_url": existing.get("source_url"),
+                "source_section": existing.get("source_section"),
+                "evidence": _compact_excerpt(str(reason)),
+                "gpt_reason": _compact_excerpt(str(reason)),
+                "status": status,
+                "action": action,
+                "mode": f"gpt_{mode}",
+            }
+        )
+    return suggestions
+
+
+def _fallback_value_for_field(field: str) -> str:
+    return "n.a." if field in GPT_TECHNICAL_FALLBACK_FIELDS or field.startswith("chem_safety.") else "Nicht bekannt"
+
+
+def _normalize_gpt_status(status: str, field: str, item: dict[str, object]) -> str:
+    value = status.strip().lower().replace(" ", "_")
+    mapping = {
+        "neu": "suggested",
+        "new": "suggested",
+        "geprueft": "reviewed",
+        "geprüft": "reviewed",
+        "reviewed": "reviewed",
+        "korrigiert": "corrected",
+        "corrected": "corrected",
+        "unklar": "needs_review",
+        "pruefpflichtig": "needs_review",
+        "prüfpflichtig": "needs_review",
+        "nicht_bekannt": "not_known",
+        "not_known": "not_known",
+        "suggested": "suggested",
+        "needs_review": "needs_review",
+    }
+    normalized = mapping.get(value, "needs_review" if field in GPT_REGULATORY_FIELDS else "suggested")
+    if field in GPT_REGULATORY_FIELDS and not _has_source_hint(str(item.get("source") or ""), str(item.get("reason") or item.get("evidence") or "")):
+        return "needs_review"
+    return normalized
+
+
+def _normalize_gpt_action(action: str, status: str, field: str) -> str:
+    value = action.strip().lower().replace("ü", "ue")
+    if value in GPT_APPLY_ACTIONS:
+        return "manual_review" if field in GPT_REGULATORY_FIELDS and status in {"needs_review", "not_known"} else "apply"
+    if value in GPT_IGNORE_ACTIONS:
+        return "ignore"
+    if value in GPT_REVIEW_ACTIONS:
+        return "manual_review"
+    return "apply" if status in {"suggested", "reviewed", "corrected"} and field not in GPT_REGULATORY_FIELDS else "manual_review"
+
+
+def _normalize_gpt_confidence(value: object, *, status: str) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = 0.2 if status in {"needs_review", "not_known"} else 0.6
+    if confidence > 1:
+        confidence = confidence / 100
+    return max(0.0, min(1.0, confidence))
+
+
+def _has_source_hint(source: str, reason: str) -> bool:
+    text = f"{source} {reason}".lower()
+    return any(token in text for token in ("sdb", "sds", "abschnitt", "section", "url", "http", "quelle"))
+
+
+def _is_review_required(item: dict[str, object]) -> bool:
+    return str(item.get("status") or "") in {"needs_review", "not_known", "unclear"} or str(item.get("action") or "") == "manual_review"
 
 
 def run_product_chemical_enrichment(
@@ -400,23 +984,35 @@ def apply_product_chemical_enrichment_suggestions(
 
     selected = set(selected_fields or [])
     if not selected:
-        selected = {str(item.get("field") or "") for item in suggestions if item.get("status") == "suggested"}
+        selected = {
+            str(item.get("field") or "")
+            for item in suggestions
+            if item.get("status") == "suggested" and str(item.get("action") or "apply").lower() in GPT_APPLY_ACTIONS
+        }
 
     chem_safety = dict(product.chemical_safety_json or {})
     applied_fields: list[str] = []
+    skipped_fields: list[str] = []
     for suggestion in suggestions:
         if not isinstance(suggestion, dict):
             continue
         field = str(suggestion.get("field") or "")
-        if field not in selected or suggestion.get("status") not in {"suggested", "needs_review"}:
+        status = str(suggestion.get("status") or "")
+        action = str(suggestion.get("action") or "").strip().lower().replace("ü", "ue")
+        if field not in selected or status not in GPT_APPLY_STATUSES:
+            continue
+        if action and action not in GPT_APPLY_ACTIONS:
+            skipped_fields.append(field)
             continue
         value = suggestion.get("suggested_value")
         if _is_blank_value(value):
+            skipped_fields.append(field)
             continue
         current_value = _current_product_value(product, field)
         bool_fill = isinstance(value, bool) and value is True and current_value in {None, False, ""}
         additive_list = isinstance(value, list) and set(_value_as_codes(current_value)).issubset(set(_value_as_codes(value)))
         if not overwrite_existing and not bool_fill and not additive_list and not _is_blank_value(current_value) and _json_stable(current_value) != _json_stable(value):
+            skipped_fields.append(field)
             continue
         _apply_enrichment_suggestion(product, chem_safety, field, value)
         applied_fields.append(field)
@@ -429,7 +1025,7 @@ def apply_product_chemical_enrichment_suggestions(
         product.chemical_enrichment_error = None
         enrichment.applied_at = datetime.now(timezone.utc)
     session.flush()
-    return {"status": "applied", "enrichment_id": enrichment.id, "applied_fields": applied_fields}
+    return {"status": "applied", "enrichment_id": enrichment.id, "applied_fields": applied_fields, "skipped_fields": skipped_fields}
 
 
 def parse_sdb_sections(text: str | None) -> dict[str, dict[str, str]]:

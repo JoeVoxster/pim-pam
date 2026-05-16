@@ -14,6 +14,8 @@ from app.services.chemical_enrichment_service import (
     _resolve_sdb_download_dir,
     apply_product_chemical_enrichment_suggestions,
     parse_sdb_sections,
+    review_product_chemical_gpt_suggestions,
+    run_product_chemical_gpt_completion,
 )
 
 
@@ -374,3 +376,172 @@ def test_apply_enrichment_suggestions_updates_structured_environmental_flags(tmp
     assert set(result["applied_fields"]) == {"chem_safety.environmentally_hazardous", "chem_safety.adr_pictograms"}
     assert product.chemical_safety_json["environmentally_hazardous"] is True
     assert product.chemical_safety_json["adr_pictograms"] == ["ADR_8", "ADR_pollution"]
+
+
+def _chemical_test_session(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+
+def test_gpt_completion_creates_missing_general_field_suggestions_without_overwrite(tmp_path, monkeypatch) -> None:
+    SessionLocal = _chemical_test_session(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CHEMICAL_ENRICHMENT_MODEL", "gpt-5.5")
+
+    def _fake_call(**kwargs):
+        return {
+            "suggestions": [
+                {
+                    "field": "density",
+                    "suggested_value": "1.060 g/cm3",
+                    "source": "SDB Abschnitt 9",
+                    "confidence": 0.82,
+                    "status": "suggested",
+                    "action": "apply",
+                    "reason": "Dichte aus Abschnitt 9.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr("app.services.chemical_enrichment_service._call_openai_chemical_json", _fake_call)
+
+    with SessionLocal() as session:
+        product = Product(sku="GPT-1", handle="gpt-1", title="GPT Produkt")
+        session.add(product)
+        session.flush()
+        result = run_product_chemical_gpt_completion(session, product.id)
+        session.refresh(product)
+
+    assert result["status"] == "needs_review"
+    assert result["suggestions"][0]["field"] == "density"
+    assert result["suggestions"][0]["suggested_value"] == "1.060 g/cm3"
+    assert product.density is None
+
+
+def test_gpt_completion_uses_not_known_and_na_fallback_without_api_key(tmp_path, monkeypatch) -> None:
+    SessionLocal = _chemical_test_session(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with SessionLocal() as session:
+        product = Product(sku="GPT-2", handle="gpt-2", title="Fallback Produkt")
+        session.add(product)
+        session.flush()
+        result = run_product_chemical_gpt_completion(session, product.id)
+
+    suggestions = {item["field"]: item for item in result["suggestions"]}
+    assert result["status"] == "missing_api_key"
+    assert suggestions["chemical_type"]["suggested_value"] == "Nicht bekannt"
+    assert suggestions["un_number"]["suggested_value"] == "n.a."
+    assert suggestions["un_number"]["action"] == "manual_review"
+    assert suggestions["un_number"]["confidence"] == 0.1
+
+
+def test_gpt_review_corrects_existing_suggestions_as_new_version(tmp_path, monkeypatch) -> None:
+    SessionLocal = _chemical_test_session(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def _fake_call(**kwargs):
+        return {
+            "suggestions": [
+                {
+                    "field": "un_number",
+                    "suggested_value": "n.a.",
+                    "source": "SDB Abschnitt 14",
+                    "confidence": 0.7,
+                    "status": "corrected",
+                    "action": "manual_review",
+                    "reason": "Nicht als Gefahrgut klassifiziert; prüfpflichtig.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr("app.services.chemical_enrichment_service._call_openai_chemical_json", _fake_call)
+
+    with SessionLocal() as session:
+        product = Product(sku="GPT-3", handle="gpt-3", title="Review Produkt")
+        session.add(product)
+        session.flush()
+        session.add(
+            ProductChemicalEnrichment(
+                product_id=product.id,
+                source_kind="sds_pdf",
+                status="needs_review",
+                normalized_payload_json={"enrichment": {"suggestions": [{"field": "un_number", "suggested_value": "2021", "status": "suggested"}]}},
+            )
+        )
+        session.commit()
+        result = review_product_chemical_gpt_suggestions(session, product.id)
+
+    assert result["suggestions"][0]["field"] == "un_number"
+    assert result["suggestions"][0]["suggested_value"] == "n.a."
+    assert result["suggestions"][0]["status"] == "corrected"
+    assert result["suggestions"][0]["action"] == "manual_review"
+
+
+def test_apply_enrichment_suggestions_only_saves_accepted_actions(tmp_path) -> None:
+    SessionLocal = _chemical_test_session(tmp_path)
+
+    with SessionLocal() as session:
+        product = Product(sku="GPT-4", handle="gpt-4", title="Apply Produkt")
+        session.add(product)
+        session.flush()
+        session.add(
+            ProductChemicalEnrichment(
+                product_id=product.id,
+                source_kind="gpt_completion",
+                status="needs_review",
+                normalized_payload_json={
+                    "enrichment": {
+                        "suggestions": [
+                            {"field": "density", "suggested_value": "1.1 g/cm3", "status": "suggested", "action": "apply"},
+                            {"field": "color", "suggested_value": "gelb", "status": "suggested", "action": "ignore"},
+                        ]
+                    }
+                },
+            )
+        )
+        session.commit()
+        result = apply_product_chemical_enrichment_suggestions(session, product.id, selected_fields=["density", "color"], overwrite_existing=False)
+        session.commit()
+        session.refresh(product)
+
+    assert result["applied_fields"] == ["density"]
+    assert product.density == "1.1 g/cm3"
+    assert product.color is None
+
+
+def test_gpt_error_is_stored_as_failed_status_with_fallback(tmp_path, monkeypatch) -> None:
+    SessionLocal = _chemical_test_session(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def _fake_call(**kwargs):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr("app.services.chemical_enrichment_service._call_openai_chemical_json", _fake_call)
+
+    with SessionLocal() as session:
+        product = Product(sku="GPT-5", handle="gpt-5", title="Error Produkt")
+        session.add(product)
+        session.flush()
+        result = run_product_chemical_gpt_completion(session, product.id)
+
+    assert result["status"] == "failed"
+    assert result["error"] == "model unavailable"
+    assert result["suggestions"]
+
+
+def test_gpt_fallback_marks_sdb_regulatory_fields_as_review_required(tmp_path, monkeypatch) -> None:
+    SessionLocal = _chemical_test_session(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with SessionLocal() as session:
+        product = Product(sku="GPT-6", handle="gpt-6", title="Reg Produkt")
+        session.add(product)
+        session.flush()
+        result = run_product_chemical_gpt_completion(session, product.id)
+
+    suggestions = {item["field"]: item for item in result["suggestions"]}
+    assert suggestions["signal_word"]["status"] == "needs_review"
+    assert suggestions["un_number"]["status"] == "needs_review"
+    assert "Prüfflichtig" in suggestions["un_number"]["evidence"]

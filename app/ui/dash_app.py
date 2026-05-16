@@ -44,10 +44,13 @@ from app.services.asset_service import create_asset_record, upload_r2_asset_from
 from app.services.chemical_enrichment_service import (
     apply_product_chemical_enrichment,
     apply_product_chemical_enrichment_suggestions,
+    get_chemical_gpt_enrichment_config_status,
     get_latest_product_chemical_enrichment,
     ingest_product_sdb_asset,
     ingest_product_sdb_pdf,
     list_product_chemical_enrichment_runs,
+    review_product_chemical_gpt_suggestions,
+    run_product_chemical_gpt_completion,
     run_product_chemical_enrichment,
 )
 from app.services.chemical_classification_service import (
@@ -505,12 +508,24 @@ SUVA_CHECK_ITEM_COLUMNS = [
 ]
 CHEMISTRY_ENRICHMENT_SUGGESTION_COLUMNS = [
     {"field": "field", "headerName": "Feld", "minWidth": 230},
-    {"field": "current_value", "headerName": "Aktuell", "minWidth": 180},
+    {"field": "current_value", "headerName": "Aktueller Wert Allgemein", "minWidth": 210},
+    {"field": "internet_value", "headerName": "Internet-Vorschlag", "minWidth": 190},
+    {"field": "gpt_value", "headerName": "GPT-Ergänzung/Korrektur", "minWidth": 220},
     {"field": "suggested_value", "headerName": "Vorschlag", "minWidth": 180},
+    {"field": "source", "headerName": "Quelle", "minWidth": 180},
     {"field": "source_section", "headerName": "Abschnitt", "maxWidth": 120},
     {"field": "confidence", "headerName": "Confidence", "maxWidth": 130},
     {"field": "status", "headerName": "Status", "maxWidth": 130},
+    {
+        "field": "action",
+        "headerName": "Aktion",
+        "minWidth": 150,
+        "editable": True,
+        "cellEditor": "agSelectCellEditor",
+        "cellEditorParams": {"values": ["apply", "ignore", "manual_review"]},
+    },
     {"field": "evidence", "headerName": "Nachweis", "flex": 1.4, "minWidth": 320},
+    {"field": "gpt_reason", "headerName": "GPT-Begründung", "flex": 1.2, "minWidth": 280},
 ]
 SDB_TRANSLATION_PROMPT_COLUMNS = [
     {"field": "id", "maxWidth": 90},
@@ -1110,6 +1125,36 @@ def _bulk_action_default(trigger_id: object, context: str) -> str:
 
 def _channel_bulk_actions_style(has_selection: bool) -> dict:
     return {"display": "block"} if has_selection else {"display": "none"}
+
+
+def _channel_bulk_category_dropdown_state(sales_channel_id: int | str | None, snapshot: dict | None) -> tuple[list[dict], None, bool, str]:
+    snapshot = snapshot or {}
+    options = snapshot.get("channel_category_options", []) or []
+    channels = snapshot.get("sales_channels", []) or []
+    if not sales_channel_id:
+        return [], None, True, "Bitte zuerst Vertriebskanal auswählen."
+    try:
+        channel_id = int(sales_channel_id)
+    except (TypeError, ValueError):
+        return [], None, True, "Fehler beim Laden der Kanal-Kategorien: ungültige Vertriebskanal-ID."
+
+    channel = next((item for item in channels if int(item.get("id") or 0) == channel_id), None)
+    channel_label = (
+        f"{channel.get('name')} ({channel.get('code')})"
+        if channel and channel.get("name") and channel.get("code")
+        else f"ID {channel_id}"
+    )
+    filtered = []
+    for item in options:
+        try:
+            item_channel_id = int(item.get("sales_channel_id"))
+        except (TypeError, ValueError):
+            continue
+        if item_channel_id == channel_id:
+            filtered.append(item)
+    if not filtered:
+        return [], None, True, f"Keine Kanal-Kategorien für {channel_label} gefunden."
+    return filtered, None, False, f"Vertriebskanal {channel_label} geladen. {len(filtered)} Kanal-Kategorien verfügbar."
 
 
 def _product_bulk_updates(fields: list[str] | None, source_language: str | None, brand_name: str | None, status: str | None, is_chemical: bool | None) -> dict[str, object]:
@@ -2001,11 +2046,16 @@ def _chemical_enrichment_suggestion_rows(enrichment: dict | None) -> list[dict]:
                 "id": index + 1,
                 "field": item.get("field"),
                 "current_value": _format_chemical_preview_value(item.get("current_value")),
+                "internet_value": _format_chemical_preview_value(item.get("internet_value") or item.get("found_value")),
+                "gpt_value": _format_chemical_preview_value(item.get("gpt_value")),
                 "suggested_value": _format_chemical_preview_value(item.get("suggested_value")),
+                "source": item.get("source"),
                 "source_section": item.get("source_section"),
                 "confidence": item.get("confidence"),
                 "status": item.get("status"),
+                "action": item.get("action") or ("apply" if item.get("status") == "suggested" else "manual_review"),
                 "evidence": item.get("evidence"),
+                "gpt_reason": item.get("gpt_reason"),
             }
         )
     return rows
@@ -2972,7 +3022,13 @@ def create_dash_app() -> Dash:
                                 [
                                     html.Div([html.Label("Aktion"), dcc.Dropdown(id="channel-bulk-action", clearable=False)]),
                                     html.Div([html.Label("Vertriebskanal"), dcc.Dropdown(id="channel-bulk-sales-channel-id", clearable=False)]),
-                                    html.Div([html.Label("Kanal-Kategorie"), dcc.Dropdown(id="channel-bulk-channel-category-id", placeholder="Optional")]),
+                                    html.Div(
+                                        [
+                                            html.Label("Kanal-Kategorie"),
+                                            dcc.Dropdown(id="channel-bulk-channel-category-id", placeholder="Optional", disabled=True),
+                                            html.Div(id="channel-bulk-category-status", className="selection-summary", style={"marginTop": "6px", "fontSize": "12px"}),
+                                        ]
+                                    ),
                                     html.Div([html.Label("Erlaubt"), dcc.Dropdown(id="channel-bulk-allowed", options=BOOLEAN_OPTIONS, value=True, clearable=False)]),
                                     html.Div([html.Label("Aktiv"), dcc.Dropdown(id="channel-bulk-is-active", options=BOOLEAN_OPTIONS, value=True, clearable=False)]),
                                     html.Div([html.Label("Publikationsstatus"), dcc.Dropdown(id="channel-bulk-publication-status", options=PUBLICATION_STATUS_OPTIONS, value="published", clearable=False)]),
@@ -4501,7 +4557,10 @@ def create_dash_app() -> Dash:
                                                             html.Div(
                                                                 [
                                                                     html.Button("Internetanreicherung starten", id="chemistry-enrichment-run-button"),
+                                                                    html.Button("Mit GPT ergänzen", id="chemistry-enrichment-gpt-complete-button"),
+                                                                    html.Button("Vorschläge mit GPT prüfen", id="chemistry-enrichment-gpt-review-button"),
                                                                     html.Button("Ausgewählte/alle Vorschläge übernehmen", id="chemistry-enrichment-apply-button"),
+                                                                    html.Button("Akzeptierte Werte in Allgemein speichern", id="chemistry-enrichment-apply-accepted-button"),
                                                                 ],
                                                                 className="button-row",
                                                                 style={"marginTop": "12px"},
@@ -4547,7 +4606,7 @@ def create_dash_app() -> Dash:
                                                                 [
                                                                     html.H4("Vorschläge zur manuellen Übernahme"),
                                                                     html.Div(
-                                                                        "Werte werden nicht automatisch veröffentlicht. Wähle einzelne Zeilen aus oder übernimm alle vorgeschlagenen Zeilen.",
+                                                                        "Werte werden nicht automatisch veröffentlicht. Setze die Aktion je Zeile und speichere nur akzeptierte Vorschläge.",
                                                                         className="selection-summary",
                                                                     ),
                                                                     grid("chemistry-enrichment-suggestions-grid", CHEMISTRY_ENRICHMENT_SUGGESTION_COLUMNS, height="280px", row_selection="multiple"),
@@ -8026,15 +8085,13 @@ def register_callbacks(app: Dash) -> None:
     @app.callback(
         Output("channel-bulk-channel-category-id", "options"),
         Output("channel-bulk-channel-category-id", "value"),
+        Output("channel-bulk-channel-category-id", "disabled"),
+        Output("channel-bulk-category-status", "children"),
         Input("channel-bulk-sales-channel-id", "value"),
         State("snapshot-store", "data"),
     )
     def filter_channel_bulk_category_options(sales_channel_id: int | None, snapshot: dict | None):
-        options = (snapshot or {}).get("channel_category_options", [])
-        if not sales_channel_id:
-            return [], None
-        filtered = [item for item in options if item.get("sales_channel_id") == sales_channel_id]
-        return filtered, None
+        return _channel_bulk_category_dropdown_state(sales_channel_id, snapshot)
 
     @app.callback(
         Output("channel-bulk-confirm", "displayed"),
@@ -8690,15 +8747,15 @@ def register_callbacks(app: Dash) -> None:
         detail = get_category_detail(session, int(category_id), sales_channel_code=sales_channel_code or DEFAULT_CATEGORY_CHANNEL_CODE)
         if detail is None:
             return [], "Kategorie nicht gefunden oder gehört nicht zum gewählten Vertriebskanal.", ""
-        products = get_products_for_category(session, int(category_id), include_variants=False)
+        products = get_products_for_category(session, int(category_id), include_variants=False, include_descendants=True)
         breadcrumb_parts = [detail.get("sales_channel_name") or detail.get("sales_channel_code")]
         if detail.get("parent_name"):
             breadcrumb_parts.append(detail["parent_name"])
         breadcrumb_parts.append(detail.get("name"))
         breadcrumb = " > ".join(str(part) for part in breadcrumb_parts if part)
         if not products:
-            return [], "Keine Produkte in dieser Kategorie.", breadcrumb
-        return products, f"{len(products)} Produkte in dieser Kategorie.", breadcrumb
+            return [], "Keine Produkte in dieser Kategorie oder ihren Unterkategorien.", breadcrumb
+        return products, f"{len(products)} Produkte in dieser Kategorie inkl. Unterkategorien.", breadcrumb
 
     @app.callback(
         Output("translation-language", "value"),
@@ -10441,7 +10498,10 @@ def register_callbacks(app: Dash) -> None:
         prevent_initial_call=True,
         running=[
             (Output("chemistry-enrichment-run-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-gpt-complete-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-gpt-review-button", "disabled"), True, False),
             (Output("chemistry-enrichment-apply-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-apply-accepted-button", "disabled"), True, False),
         ],
     )
     @_with_session
@@ -10488,6 +10548,67 @@ def register_callbacks(app: Dash) -> None:
         Output("flash-message", "children", allow_duplicate=True),
         Output("refresh-token", "data", allow_duplicate=True),
         Output("chemistry-enrichment-status", "children", allow_duplicate=True),
+        Input("chemistry-enrichment-gpt-complete-button", "n_clicks"),
+        Input("chemistry-enrichment-gpt-review-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("chemistry-product-id", "value"),
+        prevent_initial_call=True,
+        running=[
+            (Output("chemistry-enrichment-run-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-gpt-complete-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-gpt-review-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-apply-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-apply-accepted-button", "disabled"), True, False),
+        ],
+    )
+    @_with_session
+    def run_chemical_gpt_enrichment_callback(
+        session: Session,
+        complete_clicks: int | None,
+        review_clicks: int | None,
+        refresh_token: int,
+        product_id: int | None,
+    ):
+        if not product_id:
+            status = _render_chemical_internet_status("error", "Kein Chemieprodukt ausgewählt.")
+            return "Kein Chemieprodukt ausgewählt.", no_update, status
+        triggered = ctx.triggered_id
+        config = get_chemical_gpt_enrichment_config_status()
+        try:
+            if triggered == "chemistry-enrichment-gpt-review-button":
+                result = review_product_chemical_gpt_suggestions(session, int(product_id))
+                title = "GPT hat vorhandene Vorschläge geprüft."
+            else:
+                result = run_product_chemical_gpt_completion(session, int(product_id))
+                title = "GPT hat fehlende Allgemein-Felder ergänzt."
+        except ValueError as exc:
+            status = _render_chemical_internet_status("error", "GPT-Workflow konnte nicht gestartet werden.", details=[str(exc)])
+            return str(exc), no_update, status
+        except Exception as exc:
+            status = _render_chemical_internet_status("error", "GPT-Workflow fehlgeschlagen.", details=[str(exc)])
+            return f"GPT-Workflow fehlgeschlagen: {exc}", no_update, status
+        suggestion_count = int(result.get("suggestion_count") or len(result.get("suggestions") or []))
+        review_count = int(result.get("review_required_count") or 0)
+        warnings = result.get("warnings") or []
+        status_kind = "success" if result.get("status") not in {"failed", "missing_api_key"} else "error"
+        status = _render_chemical_internet_status(
+            status_kind,
+            title,
+            details=[
+                f"Modell: {config.get('model') or result.get('model') or '-'}",
+                f"Status: {result.get('status') or '-'}",
+                f"Vorschläge erzeugt: {suggestion_count}",
+                f"Prüfpflichtig/unklar: {review_count}",
+                f"Fehler: {1 if result.get('error') or result.get('status') in {'failed', 'missing_api_key'} else 0}",
+                f"Letzte Meldung: {warnings[0] if warnings else result.get('error') or '-'}",
+            ],
+        )
+        return f"{title} Vorschläge: {suggestion_count}, prüfpflichtig: {review_count}", (refresh_token or 0) + 1, status
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Output("chemistry-enrichment-status", "children", allow_duplicate=True),
         Input("chemistry-enrichment-apply-button", "n_clicks"),
         State("refresh-token", "data"),
         State("chemistry-product-id", "value"),
@@ -10496,7 +10617,10 @@ def register_callbacks(app: Dash) -> None:
         prevent_initial_call=True,
         running=[
             (Output("chemistry-enrichment-run-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-gpt-complete-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-gpt-review-button", "disabled"), True, False),
             (Output("chemistry-enrichment-apply-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-apply-accepted-button", "disabled"), True, False),
         ],
     )
     @_with_session
@@ -10542,6 +10666,81 @@ def register_callbacks(app: Dash) -> None:
             (refresh_token or 0) + 1,
             status,
         )
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Output("chemistry-enrichment-status", "children", allow_duplicate=True),
+        Input("chemistry-enrichment-apply-accepted-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("chemistry-product-id", "value"),
+        State("chemistry-enrichment-overwrite-mode", "value"),
+        State("chemistry-enrichment-suggestions-grid", "rowData"),
+        prevent_initial_call=True,
+        running=[
+            (Output("chemistry-enrichment-run-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-gpt-complete-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-gpt-review-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-apply-button", "disabled"), True, False),
+            (Output("chemistry-enrichment-apply-accepted-button", "disabled"), True, False),
+        ],
+    )
+    @_with_session
+    def apply_accepted_chemical_enrichment_callback(
+        session: Session,
+        _: int | None,
+        refresh_token: int,
+        product_id: int | None,
+        overwrite_mode: str | None,
+        row_data: list[dict] | None,
+    ):
+        if not product_id:
+            status = _render_chemical_internet_status("error", "Kein Chemieprodukt ausgewählt.")
+            return "Kein Chemieprodukt ausgewählt.", no_update, status
+        rows = row_data or []
+        accepted_fields = [
+            str(row.get("field"))
+            for row in rows
+            if row.get("field") and str(row.get("action") or "").strip().lower().replace("ü", "ue") in {"apply", "uebernehmen"}
+        ]
+        ignored = sum(1 for row in rows if str(row.get("action") or "").strip().lower() in {"ignore", "ignorieren"})
+        review_required = sum(
+            1
+            for row in rows
+            if str(row.get("action") or "").strip().lower() in {"manual_review", "manuell prüfen", "manuell_pruefen"}
+            or str(row.get("status") or "") in {"needs_review", "not_known"}
+        )
+        if not accepted_fields:
+            status = _render_chemical_internet_status(
+                "info",
+                "Keine akzeptierten Vorschläge gespeichert.",
+                details=[f"Ignoriert: {ignored}", f"Prüfpflichtig/manuell: {review_required}"],
+            )
+            return "Keine akzeptierten Vorschläge ausgewählt.", no_update, status
+        try:
+            result = apply_product_chemical_enrichment_suggestions(
+                session,
+                int(product_id),
+                selected_fields=accepted_fields,
+                overwrite_existing=(overwrite_mode == "overwrite"),
+            )
+        except ValueError as exc:
+            status = _render_chemical_internet_status("error", "Akzeptierte Vorschläge konnten nicht gespeichert werden.", details=[str(exc)])
+            return str(exc), no_update, status
+        applied_fields = result.get("applied_fields") or []
+        skipped_fields = result.get("skipped_fields") or []
+        status = _render_chemical_internet_status(
+            "success",
+            "Akzeptierte Werte wurden in Allgemein gespeichert.",
+            details=[
+                f"Gespeichert: {len(applied_fields)}",
+                f"Ignoriert: {ignored}",
+                f"Prüfpflichtig/manuell: {review_required}",
+                f"Übersprungen/konflikt: {len(skipped_fields)}",
+                f"Modus: {'überschreiben' if overwrite_mode == 'overwrite' else 'nur leere Felder'}",
+            ],
+        )
+        return f"{len(applied_fields)} Werte wurden in Allgemein gespeichert.", (refresh_token or 0) + 1, status
 
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),

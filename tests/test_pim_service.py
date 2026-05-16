@@ -1311,6 +1311,44 @@ def test_internal_channel_category_products_are_scoped_by_channel(tmp_path) -> N
     assert pos_products == []
 
 
+def test_internal_channel_category_products_include_descendant_assignments(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        ensure_default_sales_channels(session)
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="INT-CAT-TREE-1", title="Internal Category Tree Product", brand_name="VOXSTER", status="ready"),
+            VariantCreate(sku="INT-CAT-TREE-1-A", variant_title="A"),
+        )
+        root = create_category(
+            session,
+            name="Interne Root",
+            parent_id=None,
+            language_code="de",
+            sort_order=1,
+            sales_channel_code="voxster",
+        )
+        child = create_category(
+            session,
+            name="Interne Child",
+            parent_id=root.id,
+            language_code="de",
+            sort_order=1,
+            sales_channel_code="voxster",
+        )
+        set_product_categories_for_channel(session, product, [child.id], "voxster")
+        session.commit()
+
+        root_products = get_products_for_category(session, root.id)
+        root_direct_products = get_products_for_category(session, root.id, include_descendants=False)
+
+    assert [row["id"] for row in root_products] == [product.id]
+    assert root_direct_products == []
+
+
 def test_bulk_update_products_supports_preview_apply_and_backup(tmp_path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
     Base.metadata.create_all(engine)

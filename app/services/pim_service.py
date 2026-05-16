@@ -2431,16 +2431,41 @@ def get_category_detail(session: Session, category_id: int, sales_channel_code: 
     }
 
 
-def get_products_for_category(session: Session, category_id: int, include_variants: bool = False) -> list[dict]:
+def _category_descendant_ids(session: Session, category: Category) -> list[int]:
+    ids: list[int] = [int(category.id)]
+    queue: list[int] = [int(category.id)]
+    seen: set[int] = set(queue)
+    while queue:
+        parent_id = queue.pop(0)
+        child_ids = [
+            int(row)
+            for row in session.scalars(
+                select(Category.id).where(
+                    Category.parent_id == parent_id,
+                    Category.sales_channel_id == category.sales_channel_id,
+                )
+            )
+        ]
+        for child_id in child_ids:
+            if child_id in seen:
+                continue
+            seen.add(child_id)
+            ids.append(child_id)
+            queue.append(child_id)
+    return ids
+
+
+def get_products_for_category(session: Session, category_id: int, include_variants: bool = False, include_descendants: bool = True) -> list[dict]:
     category = session.get(Category, int(category_id))
     if category is None:
         return []
+    category_ids = _category_descendant_ids(session, category) if include_descendants else [int(category_id)]
     stmt = (
         select(Product)
         .join(ProductCategoryAssignment, ProductCategoryAssignment.product_id == Product.id)
         .options(joinedload(Product.brand), joinedload(Product.variants))
         .where(
-            ProductCategoryAssignment.category_id == int(category_id),
+            ProductCategoryAssignment.category_id.in_(category_ids),
             ProductCategoryAssignment.sales_channel_id == category.sales_channel_id,
         )
         .order_by(Product.title.asc(), Product.id.asc())
