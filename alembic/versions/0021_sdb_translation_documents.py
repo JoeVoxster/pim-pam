@@ -79,7 +79,7 @@ def upgrade() -> None:
         sa.Column("extracted_text", sa.Text(), nullable=True),
         sa.Column("generated_text", sa.Text(), nullable=True),
         sa.Column("status", sa.String(length=64), server_default="draft", nullable=False),
-        sa.Column("version", sa.String(length=64), nullable=True),
+        sa.Column("version", sa.String(length=255), nullable=True),
         sa.Column("valid_from", sa.String(length=32), nullable=True),
         sa.Column("created_by_ai", sa.Boolean(), server_default="0", nullable=False),
         sa.Column("ai_provider", sa.String(length=64), nullable=True),

@@ -16,10 +16,13 @@ depends_on = None
 
 def upgrade() -> None:
     bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        op.drop_constraint("categories_slug_key", "categories", type_="unique")
+        return
+
     index_rows = bind.exec_driver_sql("PRAGMA index_list('categories')").fetchall()
     for row in index_rows:
         index_name = row[1]
-        is_unique = bool(row[2])
         if index_name == "ix_categories_slug":
             op.drop_index("ix_categories_slug", table_name="categories")
             op.create_index("ix_categories_slug", "categories", ["slug"], unique=False)
@@ -29,6 +32,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        op.create_unique_constraint("categories_slug_key", "categories", ["slug"])
+        return
+
     index_rows = bind.exec_driver_sql("PRAGMA index_list('categories')").fetchall()
     for row in index_rows:
         index_name = row[1]

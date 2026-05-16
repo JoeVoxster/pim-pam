@@ -33,7 +33,7 @@ def upgrade() -> None:
     if "dry_run" not in columns:
         op.add_column(
             "product_enrichment_logs",
-            sa.Column("dry_run", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+            sa.Column("dry_run", sa.Boolean(), nullable=False, server_default=sa.false()),
         )
     if "language_code" not in columns:
         op.add_column("product_enrichment_logs", sa.Column("language_code", sa.String(length=12), nullable=True))

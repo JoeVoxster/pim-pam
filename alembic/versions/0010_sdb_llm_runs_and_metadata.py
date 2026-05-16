@@ -19,7 +19,7 @@ depends_on = None
 
 def upgrade() -> None:
     op.add_column("product_sdb", sa.Column("review_status", sa.String(length=64), nullable=True))
-    op.add_column("product_sdb", sa.Column("version_label", sa.String(length=64), nullable=True))
+    op.add_column("product_sdb", sa.Column("version_label", sa.String(length=255), nullable=True))
     op.add_column("product_sdb", sa.Column("effective_date", sa.String(length=32), nullable=True))
     op.add_column("product_sdb", sa.Column("issuer_name", sa.String(length=255), nullable=True))
     op.add_column("product_sdb", sa.Column("issuer_address_line1", sa.String(length=255), nullable=True))
