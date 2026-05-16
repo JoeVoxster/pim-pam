@@ -652,12 +652,16 @@ class ProductCategoryMapping(TimestampMixin, Base):
         UniqueConstraint("product_id", "sales_channel_id", "channel_category_id", name="uq_product_category_mappings_scope"),
         Index("ix_product_category_mappings_product_id", "product_id"),
         Index("ix_product_category_mappings_sales_channel_id", "sales_channel_id"),
+        Index("ix_product_category_mappings_channel_category_id", "channel_category_id"),
+        Index("ix_product_category_mappings_position", "position"),
+        Index("ix_product_category_mappings_category_position", "channel_category_id", "position", "product_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
     sales_channel_id: Mapped[int] = mapped_column(ForeignKey("sales_channels.id", ondelete="CASCADE"), nullable=False)
     channel_category_id: Mapped[int] = mapped_column(ForeignKey("channel_categories.id", ondelete="CASCADE"), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=9999, server_default="9999")
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
 
     product: Mapped[Product] = relationship(back_populates="channel_category_mappings")

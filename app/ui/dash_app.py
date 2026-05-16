@@ -147,6 +147,8 @@ from app.services.pim_service import (
     DEFAULT_CATEGORY_CHANNEL_CODE,
     archive_product,
     archive_variants,
+    bulk_update_category_product_positions,
+    bulk_update_channel_category_product_positions,
     bulk_update_products,
     bulk_update_variants,
     bulk_upsert_product_category_mappings,
@@ -653,7 +655,7 @@ CHANNEL_CATEGORY_TREE_COLUMNS = [
 ]
 CHANNEL_CATEGORY_PRODUCT_COLUMNS = [
     {"field": "id", "maxWidth": 90},
-    {"field": "sort_order", "headerName": "#", "maxWidth": 80},
+    {"field": "position", "headerName": "Position", "maxWidth": 120, "editable": True},
     {"field": "sku", "headerName": "SKU", "minWidth": 150},
     {"field": "photo_asset_id", "headerName": "Bild", "maxWidth": 90, "editable": False, "filter": False, "sortable": False, "cellRenderer": "ProductPhotoCell"},
     {"field": "title", "headerName": "Produkt", "flex": 1.5, "minWidth": 260, "cellRenderer": "ProductCategoryDragCell"},
@@ -684,6 +686,7 @@ PRODUCT_CATEGORY_MAPPING_COLUMNS = [
     {"field": "external_category_id", "headerName": "Externe ID", "minWidth": 160},
     {"field": "channel_category_name", "headerName": "Kategorie", "minWidth": 180},
     {"field": "external_path", "headerName": "Pfad", "flex": 1, "minWidth": 260},
+    {"field": "position", "headerName": "Position", "maxWidth": 120, "editable": True},
     {"field": "is_primary", "headerName": "Primär", "maxWidth": 100},
 ]
 VARIANT_CATEGORY_MAPPING_COLUMNS = [
@@ -1134,6 +1137,16 @@ def _reordered_product_ids_for_drop(
     if position == "after":
         insert_index += 1
     return remaining[:insert_index] + dragged + remaining[insert_index:]
+
+
+def _position_rows_for_save(rows: list[dict] | None, *, mode: str = "as_is") -> list[dict]:
+    row_list = [dict(row) for row in (rows or []) if row.get("id") is not None]
+    if mode == "az":
+        row_list.sort(key=lambda row: (str(row.get("title") or "").lower(), int(row.get("id") or 0)))
+    if mode in {"az", "steps10"}:
+        for index, row in enumerate(row_list, start=1):
+            row["position"] = index * 10
+    return [{"product_id": int(row["id"]), "position": row.get("position", row.get("sort_order"))} for row in row_list]
 
 
 def _bulk_action_options(context: str | None) -> list[dict]:
@@ -5276,6 +5289,14 @@ def create_dash_app() -> Dash:
                                                         "Produkte am Titel greifen und auf eine Zielkategorie im Baum ziehen.",
                                                         className="category-tree-description",
                                                     ),
+                                                    html.Div(
+                                                        [
+                                                            html.Button("Positionen speichern", id="category-products-save-positions-button"),
+                                                            html.Button("Automatisch A-Z neu nummerieren", id="category-products-renumber-az-button"),
+                                                            html.Button("Positionen 10er-Schritte neu setzen", id="category-products-renumber-10-button"),
+                                                        ],
+                                                        className="button-row",
+                                                    ),
                                                     html.Div(id="category-products-status", className="selection-summary"),
                                                     html.Div(id="category-breadcrumb", className="category-tree-description"),
                                                     grid(
@@ -5489,6 +5510,14 @@ def create_dash_app() -> Dash:
                                             html.Div(
                                                 [
                                                     html.H4("Produkte dieser Kategorie"),
+                                                    html.Div(
+                                                        [
+                                                            html.Button("Positionen speichern", id="channel-category-products-save-positions-button"),
+                                                            html.Button("Automatisch A-Z neu nummerieren", id="channel-category-products-renumber-az-button"),
+                                                            html.Button("Positionen 10er-Schritte neu setzen", id="channel-category-products-renumber-10-button"),
+                                                        ],
+                                                        className="button-row",
+                                                    ),
                                                     html.Div(id="channel-category-products-status", className="selection-summary"),
                                                     html.Div(id="channel-category-breadcrumb", className="category-tree-description"),
                                                     grid("channel-category-products-grid", CHANNEL_CATEGORY_PRODUCT_COLUMNS, height="420px"),
@@ -8726,6 +8755,44 @@ def register_callbacks(app: Dash) -> None:
         return products, f"{len(products)} Produkte in dieser Kanal-Kategorie.", breadcrumb
 
     @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("channel-category-products-status", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("channel-category-products-save-positions-button", "n_clicks"),
+        Input("channel-category-products-renumber-az-button", "n_clicks"),
+        Input("channel-category-products-renumber-10-button", "n_clicks"),
+        State("selected-channel-category-id", "data"),
+        State("channel-category-products-grid", "rowData"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_channel_category_product_positions(
+        session: Session,
+        _save_clicks: int | None,
+        _az_clicks: int | None,
+        _steps_clicks: int | None,
+        category_id: int | None,
+        rows: list[dict] | None,
+        refresh_token: int | None,
+    ):
+        if not category_id:
+            return "Kanal-Kategorie fehlt.", no_update, no_update
+        mode = "as_is"
+        if ctx.triggered_id == "channel-category-products-renumber-az-button":
+            mode = "az"
+        elif ctx.triggered_id == "channel-category-products-renumber-10-button":
+            mode = "steps10"
+        try:
+            payload = _position_rows_for_save(rows, mode=mode)
+            count = bulk_update_channel_category_product_positions(session, int(category_id), payload)
+        except Exception as exc:
+            message = f"Fehler beim Speichern der Positionen: {exc}"
+            return message, message, no_update
+        message = f"{count} Position(en) gespeichert."
+        return message, message, (refresh_token or 0) + 1
+
+    @app.callback(
         Output("categories-grid", "rowData"),
         Output("category-parent-id", "options"),
         Output("category-detail-parent-id", "options"),
@@ -8813,6 +8880,44 @@ def register_callbacks(app: Dash) -> None:
         if not products:
             return [], "Keine Produkte in dieser Kategorie oder ihren Unterkategorien.", breadcrumb
         return products, f"{len(products)} Produkte in dieser Kategorie inkl. Unterkategorien.", breadcrumb
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("category-products-status", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("category-products-save-positions-button", "n_clicks"),
+        Input("category-products-renumber-az-button", "n_clicks"),
+        Input("category-products-renumber-10-button", "n_clicks"),
+        State("selected-category-id", "data"),
+        State("category-products-grid", "rowData"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_category_product_positions(
+        session: Session,
+        _save_clicks: int | None,
+        _az_clicks: int | None,
+        _steps_clicks: int | None,
+        category_id: int | None,
+        rows: list[dict] | None,
+        refresh_token: int | None,
+    ):
+        if not category_id:
+            return "Kategorie fehlt.", no_update, no_update
+        mode = "as_is"
+        if ctx.triggered_id == "category-products-renumber-az-button":
+            mode = "az"
+        elif ctx.triggered_id == "category-products-renumber-10-button":
+            mode = "steps10"
+        try:
+            payload = _position_rows_for_save(rows, mode=mode)
+            count = bulk_update_category_product_positions(session, int(category_id), payload)
+        except Exception as exc:
+            message = f"Fehler beim Speichern der Positionen: {exc}"
+            return message, message, no_update
+        message = f"{count} Position(en) gespeichert."
+        return message, message, (refresh_token or 0) + 1
 
     @app.callback(
         Output("translation-language", "value"),
@@ -12358,6 +12463,35 @@ def register_callbacks(app: Dash) -> None:
             ),
         )
         return "Kanal-Kategorie-Mapping gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("product-detail-category-mappings", "cellValueChanged"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_product_category_mapping_grid_callback(session: Session, event: dict | None, refresh_token: int):
+        if not event:
+            return no_update, no_update
+        row = event.get("data") or {}
+        if not row.get("product_id") or not row.get("sales_channel_id") or not row.get("channel_category_id"):
+            return no_update, no_update
+        try:
+            upsert_product_category_mapping(
+                session,
+                ProductCategoryMappingUpsert(
+                    product_id=int(row["product_id"]),
+                    sales_channel_id=int(row["sales_channel_id"]),
+                    channel_category_id=int(row["channel_category_id"]),
+                    position=_int_or_zero(row.get("position")) if row.get("position") not in {None, ""} else 9999,
+                    is_primary=bool(row.get("is_primary")),
+                ),
+            )
+        except Exception as exc:
+            return f"Fehler beim Speichern der Positionen: {exc}", no_update
+        return "Kanal-Kategorie-Position gespeichert.", (refresh_token or 0) + 1
 
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),

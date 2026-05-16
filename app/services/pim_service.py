@@ -464,24 +464,28 @@ def get_products_for_channel_category(session: Session, category_id: int, includ
     category = session.get(ChannelCategory, int(category_id))
     if category is None:
         return []
-    product_ids = (
-        select(Product.id)
-        .join(ProductCategoryMapping, ProductCategoryMapping.product_id == Product.id)
+    mapping_rows = session.execute(
+        select(ProductCategoryMapping.product_id, ProductCategoryMapping.position)
+        .select_from(ProductCategoryMapping)
+        .join(Product, Product.id == ProductCategoryMapping.product_id)
         .where(
             ProductCategoryMapping.channel_category_id == int(category_id),
             ProductCategoryMapping.sales_channel_id == category.sales_channel_id,
         )
-        .distinct()
-        .subquery()
-    )
+        .order_by(ProductCategoryMapping.position.asc(), Product.title.asc(), Product.id.asc())
+    ).all()
+    product_order = {int(row.product_id): index for index, row in enumerate(mapping_rows)}
+    positions = {int(row.product_id): int(row.position if row.position is not None else 9999) for row in mapping_rows}
+    if not product_order:
+        return []
     stmt = (
         select(Product)
-        .options(joinedload(Product.brand), joinedload(Product.variants))
-        .where(Product.id.in_(select(product_ids.c.id)))
-        .order_by(Product.title.asc(), Product.id.asc())
+        .options(joinedload(Product.brand), joinedload(Product.variants), joinedload(Product.assets))
+        .where(Product.id.in_(product_order.keys()))
     )
     rows: list[dict] = []
-    for product in session.scalars(stmt).unique():
+    for product in sorted(session.scalars(stmt).unique(), key=lambda item: product_order.get(int(item.id), 0)):
+        primary_asset = _primary_image_asset(product)
         variant_rows = [
             {
                 "id": variant.id,
@@ -494,8 +498,15 @@ def get_products_for_channel_category(session: Session, category_id: int, includ
         rows.append(
             {
                 "id": product.id,
+                "position": positions.get(int(product.id), 9999),
+                "sort_order": positions.get(int(product.id), 9999),
                 "sku": product.sku,
                 "title": product.title,
+                "photo_asset_id": primary_asset.id if primary_asset else None,
+                "photo_url": f"/asset-file/{primary_asset.id}" if primary_asset else None,
+                "photo_thumb_url": f"/asset-thumb/{primary_asset.id}" if primary_asset else None,
+                "photo_filename": primary_asset.filename if primary_asset else None,
+                "photo_mime_type": primary_asset.mime_type if primary_asset else None,
                 "brand": product.brand.name if product.brand else None,
                 "status": product.status,
                 "variant_count": len(product.variants),
@@ -548,6 +559,7 @@ def _serialize_product_channel_listing(product_id: int, row: ProductChannelListi
         "channel_category_id": category_mapping.channel_category_id if category_mapping else None,
         "channel_category_name": category_mapping.channel_category.name if category_mapping and category_mapping.channel_category else None,
         "channel_external_category_id": category_mapping.channel_category.external_category_id if category_mapping and category_mapping.channel_category else None,
+        "channel_category_position": int(category_mapping.position if category_mapping and category_mapping.position is not None else 9999),
         "is_primary_category": bool(category_mapping.is_primary) if category_mapping else False,
     }
 
@@ -678,6 +690,7 @@ def list_product_category_mappings(session: Session, product_id: int) -> list[di
             "channel_category_name": row.channel_category.name if row.channel_category else None,
             "external_category_id": row.channel_category.external_category_id if row.channel_category else None,
             "external_path": row.channel_category.external_path if row.channel_category else None,
+            "position": int(row.position if row.position is not None else 9999),
             "is_primary": bool(row.is_primary),
         }
         for row in session.scalars(stmt).unique()
@@ -710,6 +723,8 @@ def upsert_product_category_mapping(session: Session, payload: ProductCategoryMa
             channel_category_id=payload.channel_category_id,
         )
         session.add(row)
+    if payload.position is not None:
+        row.position = _normalize_category_position(payload.position)
     row.is_primary = bool(payload.is_primary)
     if row.is_primary:
         for sibling in session.scalars(
@@ -722,6 +737,110 @@ def upsert_product_category_mapping(session: Session, payload: ProductCategoryMa
             sibling.is_primary = False
     session.flush()
     return row
+
+
+def _normalize_category_position(value: object) -> int:
+    if value in {None, ""}:
+        return 9999
+    try:
+        position = int(float(str(value)))
+    except (TypeError, ValueError):
+        raise ValueError("Position muss numerisch sein")
+    if position < 0:
+        raise ValueError("Position darf nicht negativ sein")
+    return position
+
+
+def update_product_category_position(
+    session: Session,
+    category_id: int,
+    product_id: int,
+    position: object,
+    *,
+    sales_channel_id: int | None = None,
+) -> ProductCategoryAssignment:
+    category = session.get(Category, int(category_id))
+    if category is None:
+        raise ValueError("Kategorie nicht gefunden")
+    channel_id = int(sales_channel_id or category.sales_channel_id)
+    row = session.scalar(
+        select(ProductCategoryAssignment).where(
+            ProductCategoryAssignment.category_id == int(category_id),
+            ProductCategoryAssignment.sales_channel_id == channel_id,
+            ProductCategoryAssignment.product_id == int(product_id),
+        )
+    )
+    if row is None:
+        raise ValueError("Produkt ist nicht in dieser Kategorie")
+    row.sort_order = _normalize_category_position(position)
+    session.flush()
+    return row
+
+
+def bulk_update_category_product_positions(
+    session: Session,
+    category_id: int,
+    rows: Iterable[dict],
+    *,
+    sales_channel_id: int | None = None,
+) -> int:
+    count = 0
+    for row in rows:
+        product_id = row.get("product_id") or row.get("id")
+        if product_id in {None, ""}:
+            continue
+        update_product_category_position(
+            session,
+            int(category_id),
+            int(product_id),
+            row.get("position", row.get("sort_order")),
+            sales_channel_id=sales_channel_id,
+        )
+        count += 1
+    return count
+
+
+def update_product_channel_category_position(
+    session: Session,
+    channel_category_id: int,
+    product_id: int,
+    position: object,
+) -> ProductCategoryMapping:
+    category = session.get(ChannelCategory, int(channel_category_id))
+    if category is None:
+        raise ValueError("Kanal-Kategorie nicht gefunden")
+    row = session.scalar(
+        select(ProductCategoryMapping).where(
+            ProductCategoryMapping.channel_category_id == int(channel_category_id),
+            ProductCategoryMapping.sales_channel_id == category.sales_channel_id,
+            ProductCategoryMapping.product_id == int(product_id),
+        )
+    )
+    if row is None:
+        raise ValueError("Produkt ist nicht in dieser Kanal-Kategorie")
+    row.position = _normalize_category_position(position)
+    session.flush()
+    return row
+
+
+def bulk_update_channel_category_product_positions(
+    session: Session,
+    channel_category_id: int,
+    rows: Iterable[dict],
+) -> int:
+    count = 0
+    for row in rows:
+        product_id = row.get("product_id") or row.get("id")
+        if product_id in {None, ""}:
+            continue
+        update_product_channel_category_position(
+            session,
+            int(channel_category_id),
+            int(product_id),
+            row.get("position", row.get("sort_order")),
+        )
+        count += 1
+    return count
 
 
 def list_variant_category_mappings(session: Session, product_id: int) -> list[dict]:
@@ -2566,6 +2685,7 @@ def get_products_for_category(session: Session, category_id: int, include_varian
         rows.append(
             {
                 "id": product.id,
+                "position": sort_orders.get(int(product.id), 9999),
                 "sort_order": sort_orders.get(int(product.id), 0),
                 "sku": product.sku,
                 "title": product.title,
@@ -3095,7 +3215,7 @@ def _first_primary_channel_mapping(product: Product, sales_channel_id: int) -> P
     candidates = [row for row in product.channel_category_mappings if row.sales_channel_id == sales_channel_id]
     if not candidates:
         return None
-    candidates.sort(key=lambda item: (0 if item.is_primary else 1, item.id))
+    candidates.sort(key=lambda item: (0 if item.is_primary else 1, item.position, item.id))
     return candidates[0]
 
 
@@ -3260,6 +3380,8 @@ def export_medusa_products(
                 joinedload(Product.brand),
                 joinedload(Product.translations),
                 joinedload(Product.assets),
+                joinedload(Product.channel_category_mappings).joinedload(ProductCategoryMapping.sales_channel),
+                joinedload(Product.channel_category_mappings).joinedload(ProductCategoryMapping.channel_category),
                 joinedload(Product.variants).joinedload(ProductVariant.translations),
                 joinedload(Product.variants).joinedload(ProductVariant.assets),
                 joinedload(Product.variants).joinedload(ProductVariant.price_tiers),
@@ -3338,6 +3460,7 @@ def _medusa_product_output_rows(products: list[Product], *, language_code: str |
 
 
 def _medusa_extra_fields(product: Product, variant: ProductVariant, handle: str | None, rank: int) -> dict[str, object]:
+    category_sort_positions = _medusa_category_sort_positions(product)
     extra_fields: dict[str, object] = {
         "medusa_product_handle": handle,
         "medusa_product_metadata": {
@@ -3346,6 +3469,7 @@ def _medusa_extra_fields(product: Product, variant: ProductVariant, handle: str 
             "source_language": product.source_language,
             "family_key": product.family_key,
             "is_chemical": bool(product.is_chemical),
+            "pim_category_sort_positions": category_sort_positions,
         },
         "medusa_variant_metadata": {
             "pim_variant_id": variant.id,
@@ -3359,6 +3483,25 @@ def _medusa_extra_fields(product: Product, variant: ProductVariant, handle: str 
     extra_fields["medusa_variant_manage_inventory"] = "TRUE"
     extra_fields["medusa_variant_allow_backorder"] = "FALSE"
     return {key: value for key, value in extra_fields.items() if value not in (None, "", {}, [])}
+
+
+def _medusa_category_sort_positions(product: Product) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for mapping in sorted(product.channel_category_mappings or [], key=lambda item: (item.sales_channel_id, item.position, item.channel_category_id)):
+        if not mapping.channel_category:
+            continue
+        rows.append(
+            {
+                "sales_channel": mapping.sales_channel.name if mapping.sales_channel else str(mapping.sales_channel_id),
+                "sales_channel_code": mapping.sales_channel.code if mapping.sales_channel else None,
+                "channel_category_id": mapping.channel_category_id,
+                "external_category_id": mapping.channel_category.external_category_id,
+                "category_handle": mapping.channel_category.external_category_id,
+                "category_path": mapping.channel_category.external_path,
+                "position": int(mapping.position if mapping.position is not None else 9999),
+            }
+        )
+    return rows
 
 
 def _asset_urls(assets: list[Asset], *, r2_public_base_url: str | None = None) -> list[str]:

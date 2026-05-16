@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
-from app.db.models import Asset, MedusaConnectionConfig, MedusaSyncMapping, MedusaSyncRunItem, Product, ProductTranslation, ProductVariant, R2StorageConfig
+from app.db.models import Asset, ChannelCategory, MedusaConnectionConfig, MedusaSyncMapping, MedusaSyncRunItem, Product, ProductCategoryMapping, ProductTranslation, ProductVariant, R2StorageConfig, SalesChannel
 from app.services.medusa.client import MedusaAdminApiClient, MedusaAuthError
 from app.services.medusa.config_service import get_or_create_medusa_connection, save_medusa_connection
 from app.services.medusa.mappers import MedusaPricingMapper, MedusaProductMapper, MedusaVariantMapper, normalize_handle
@@ -90,11 +90,28 @@ def test_product_and_variant_payload_mapping(tmp_path) -> None:
     config = get_or_create_medusa_connection(session)
     product = Product(id=1, sku="A01-000K", handle="jolly-smak", title="Jolly Smak", status="active", source_language="en")
     variant = ProductVariant(id=10, product_id=1, sku="A01-000K", variant_title="Jolly Smak 10kg", price=Decimal("74.40"), currency="CHF")
+    channel = SalesChannel(id=1, code="voxster", name="voxster.ch")
+    channel_category = ChannelCategory(id=2, sales_channel_id=1, external_category_id="detergents", external_path="Shop > Detergents", name="Detergents")
+    mapping = ProductCategoryMapping(product_id=1, sales_channel_id=1, channel_category_id=2, position=70)
+    mapping.sales_channel = channel
+    mapping.channel_category = channel_category
     product.variants = [variant]
+    product.channel_category_mappings = [mapping]
     product_payload = MedusaProductMapper(config).map_product(product, translation=None, image_urls=["https://media.voxster.ch/img.jpg"])
     variant_payload = MedusaVariantMapper(config).map_variant(variant, translation=None)
     assert product_payload.payload["handle"] == "jolly-smak"
     assert product_payload.payload["metadata"]["pim_product_id"] == 1
+    assert product_payload.payload["metadata"]["pim_category_sort_positions"] == [
+        {
+            "sales_channel": "voxster.ch",
+            "sales_channel_code": "voxster",
+            "channel_category_id": 2,
+            "external_category_id": "detergents",
+            "category_handle": "detergents",
+            "category_path": "Shop > Detergents",
+            "position": 70,
+        }
+    ]
     assert product_payload.payload["images"] == [{"url": "https://media.voxster.ch/img.jpg"}]
     assert product_payload.payload["options"] == [{"title": "Variante", "values": ["Jolly Smak 10kg"]}]
     assert variant_payload.payload["sku"] == "A01-000K"

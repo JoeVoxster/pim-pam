@@ -81,6 +81,9 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "product-category-channel-code" in layout_repr
     assert "category-products-grid" in layout_repr
     assert "category-products-status" in layout_repr
+    assert "category-products-save-positions-button" in layout_repr
+    assert "channel-category-products-save-positions-button" in layout_repr
+    assert "Positionen 10er-Schritte neu setzen" in layout_repr
     assert "Externe Kanal-Kategorien" in layout_repr
     assert "product-detail-channel-listings" in layout_repr
     assert "product-detail-category-mappings" in layout_repr
@@ -256,6 +259,17 @@ def test_reordered_product_ids_for_drop_inserts_before_or_after_target() -> None
     assert _reordered_product_ids_for_drop(rows, [4], 2, "before") == [1, 4, 2, 3]
     assert _reordered_product_ids_for_drop(rows, [1], 3, "after") == [2, 3, 1, 4]
     assert _reordered_product_ids_for_drop(rows, [2, 3], 4, "after") == [1, 4, 2, 3]
+
+
+def test_position_rows_for_save_can_renumber_az() -> None:
+    from app.ui.dash_app import _position_rows_for_save
+
+    rows = [{"id": 1, "title": "Beta"}, {"id": 2, "title": "Alpha"}]
+
+    assert _position_rows_for_save(rows, mode="az") == [
+        {"product_id": 2, "position": 10},
+        {"product_id": 1, "position": 20},
+    ]
 
 
 def test_dedupe_group_deselect_removes_only_group_products() -> None:

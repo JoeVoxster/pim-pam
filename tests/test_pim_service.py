@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 
 import fitz
@@ -26,6 +27,8 @@ from app.schemas.pim import (
 )
 from app.services.pim_service import (
     bulk_update_products,
+    bulk_update_category_product_positions,
+    bulk_update_channel_category_product_positions,
     bulk_update_variants,
     bulk_upsert_product_category_mappings,
     bulk_upsert_product_channel_listings,
@@ -45,6 +48,7 @@ from app.services.pim_service import (
     get_product_detail,
     get_products_for_category,
     get_products_for_channel_category,
+    update_product_channel_category_position,
     move_products_to_category,
     get_product_sdb,
     get_category_detail,
@@ -698,6 +702,25 @@ def test_export_medusa_products_uses_selected_products_and_translation(tmp_path)
                 slug="deutscher-titel",
             ),
         )
+        voxster = next(channel for channel in ensure_default_sales_channels(session) if channel.code == "voxster")
+        channel_category = upsert_channel_category(
+            session,
+            ChannelCategoryUpsert(
+                sales_channel_id=voxster.id,
+                external_category_id="med-cat",
+                external_path="Medusa > Category",
+                name="Category",
+            ),
+        )
+        upsert_product_category_mapping(
+            session,
+            ProductCategoryMappingUpsert(
+                product_id=product.id,
+                sales_channel_id=voxster.id,
+                channel_category_id=channel_category.id,
+                position=70,
+            ),
+        )
         result = export_medusa_products(session, [product.id], language_code="de-CH", output_dir=tmp_path / "medusa_exports")
         session.commit()
 
@@ -710,6 +733,9 @@ def test_export_medusa_products_uses_selected_products_and_translation(tmp_path)
     assert frame.loc[0, "Product Title"] == "Deutscher Titel"
     assert frame.loc[0, "Product Description"] == "Deutsche Beschreibung"
     assert frame.loc[0, "Variant SKU"] == variant.sku
+    metadata = json.loads(frame.loc[0, "Product Metadata"])
+    assert metadata["pim_category_sort_positions"][0]["channel_category_id"] == channel_category.id
+    assert metadata["pim_category_sort_positions"][0]["position"] == 70
     assert str(frame.loc[0, "Variant Barcode"]) == "761000000001"
     assert frame.loc[0, "Variant Price CHF"] == 12.9
 
@@ -1320,6 +1346,115 @@ def test_channel_category_tree_builds_multiple_levels_and_products_are_scoped(tm
     assert products[0]["sku"] == "TREE-1"
     assert products[0]["variant_count"] == 2
     assert empty_products == []
+
+
+def test_channel_category_product_positions_are_per_channel_category(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        channels = ensure_default_sales_channels(session)
+        voxster = next(channel for channel in channels if channel.code == "voxster")
+        pos = next(channel for channel in channels if channel.code == "pos")
+        voxster_a = upsert_channel_category(session, ChannelCategoryUpsert(sales_channel_id=voxster.id, external_category_id="vox-a", name="Vox A"))
+        voxster_b = upsert_channel_category(session, ChannelCategoryUpsert(sales_channel_id=voxster.id, external_category_id="vox-b", name="Vox B"))
+        pos_a = upsert_channel_category(session, ChannelCategoryUpsert(sales_channel_id=pos.id, external_category_id="pos-a", name="POS A"))
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="POS-PER-CAT", title="Same Product", brand_name="VOXSTER", status="ready"),
+            VariantCreate(sku="POS-PER-CAT-A", variant_title="A"),
+        )
+        upsert_product_category_mapping(session, ProductCategoryMappingUpsert(product_id=product.id, sales_channel_id=voxster.id, channel_category_id=voxster_a.id, position=10))
+        upsert_product_category_mapping(session, ProductCategoryMappingUpsert(product_id=product.id, sales_channel_id=voxster.id, channel_category_id=voxster_b.id, position=80))
+        upsert_product_category_mapping(session, ProductCategoryMappingUpsert(product_id=product.id, sales_channel_id=pos.id, channel_category_id=pos_a.id, position=30))
+        session.commit()
+
+        detail = get_product_detail(session, product.id)
+        vox_a_products = get_products_for_channel_category(session, voxster_a.id)
+        vox_b_products = get_products_for_channel_category(session, voxster_b.id)
+        pos_products = get_products_for_channel_category(session, pos_a.id)
+
+    positions = {row["channel_category_id"]: row["position"] for row in detail["channel_category_mappings"]}
+    assert positions == {voxster_a.id: 10, voxster_b.id: 80, pos_a.id: 30}
+    assert vox_a_products[0]["position"] == 10
+    assert vox_b_products[0]["position"] == 80
+    assert pos_products[0]["position"] == 30
+
+
+def test_channel_category_product_list_orders_by_position_then_title(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        voxster = next(channel for channel in ensure_default_sales_channels(session) if channel.code == "voxster")
+        category = upsert_channel_category(session, ChannelCategoryUpsert(sales_channel_id=voxster.id, external_category_id="sort", name="Sort"))
+        product_b, _variant_b = create_product(session, ProductCreate(sku="SORT-B", title="Beta", status="ready"), VariantCreate(sku="SORT-B-A", variant_title="A"))
+        product_a, _variant_a = create_product(session, ProductCreate(sku="SORT-A", title="Alpha", status="ready"), VariantCreate(sku="SORT-A-A", variant_title="A"))
+        product_c, _variant_c = create_product(session, ProductCreate(sku="SORT-C", title="Gamma", status="ready"), VariantCreate(sku="SORT-C-A", variant_title="A"))
+        upsert_product_category_mapping(session, ProductCategoryMappingUpsert(product_id=product_b.id, sales_channel_id=voxster.id, channel_category_id=category.id, position=20))
+        upsert_product_category_mapping(session, ProductCategoryMappingUpsert(product_id=product_a.id, sales_channel_id=voxster.id, channel_category_id=category.id, position=20))
+        upsert_product_category_mapping(session, ProductCategoryMappingUpsert(product_id=product_c.id, sales_channel_id=voxster.id, channel_category_id=category.id, position=10))
+        session.commit()
+
+        rows = get_products_for_channel_category(session, category.id)
+
+    assert [row["sku"] for row in rows] == ["SORT-C", "SORT-A", "SORT-B"]
+
+
+def test_bulk_update_channel_category_product_positions(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        voxster = next(channel for channel in ensure_default_sales_channels(session) if channel.code == "voxster")
+        category = upsert_channel_category(session, ChannelCategoryUpsert(sales_channel_id=voxster.id, external_category_id="bulk", name="Bulk"))
+        product_a, _variant_a = create_product(session, ProductCreate(sku="BULK-A", title="A", status="ready"), VariantCreate(sku="BULK-A-A", variant_title="A"))
+        product_b, _variant_b = create_product(session, ProductCreate(sku="BULK-B", title="B", status="ready"), VariantCreate(sku="BULK-B-A", variant_title="A"))
+        upsert_product_category_mapping(session, ProductCategoryMappingUpsert(product_id=product_a.id, sales_channel_id=voxster.id, channel_category_id=category.id))
+        upsert_product_category_mapping(session, ProductCategoryMappingUpsert(product_id=product_b.id, sales_channel_id=voxster.id, channel_category_id=category.id))
+        session.commit()
+
+        count = bulk_update_channel_category_product_positions(
+            session,
+            category.id,
+            [{"product_id": product_a.id, "position": 40}, {"product_id": product_b.id, "position": 10}],
+        )
+        session.commit()
+        rows = get_products_for_channel_category(session, category.id)
+
+    assert count == 2
+    assert [row["sku"] for row in rows] == ["BULK-B", "BULK-A"]
+    assert [row["position"] for row in rows] == [10, 40]
+
+
+def test_bulk_update_internal_category_product_positions(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        ensure_default_sales_channels(session)
+        category = create_category(session, "Internal Position", None, "de", 1, sales_channel_code="voxster")
+        product_a, _variant_a = create_product(session, ProductCreate(sku="INT-A", title="A", status="ready"), VariantCreate(sku="INT-A-A", variant_title="A"))
+        product_b, _variant_b = create_product(session, ProductCreate(sku="INT-B", title="B", status="ready"), VariantCreate(sku="INT-B-A", variant_title="A"))
+        set_product_categories_for_channel(session, product_a, [category.id], "voxster")
+        set_product_categories_for_channel(session, product_b, [category.id], "voxster")
+        session.commit()
+
+        count = bulk_update_category_product_positions(
+            session,
+            category.id,
+            [{"product_id": product_a.id, "position": 30}, {"product_id": product_b.id, "position": 10}],
+        )
+        session.commit()
+        rows = get_products_for_category(session, category.id)
+
+    assert count == 2
+    assert [row["sku"] for row in rows] == ["INT-B", "INT-A"]
+    assert [row["position"] for row in rows] == [10, 30]
 
 
 def test_internal_channel_category_products_are_scoped_by_channel(tmp_path) -> None:

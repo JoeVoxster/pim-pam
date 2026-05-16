@@ -59,6 +59,7 @@ class MedusaProductMapper:
             "source_language": product.source_language,
             "family_key": product.family_key,
             "is_chemical": bool(product.is_chemical),
+            "pim_category_sort_positions": _category_sort_positions(product),
             "seo_title": translation.seo_title if translation else None,
             "seo_description": translation.seo_description if translation else None,
         }
@@ -125,6 +126,26 @@ def product_options(product: Product) -> list[dict[str, Any]]:
         if value not in grouped[name]:
             grouped[name].append(value)
     return [{"title": title, "values": values} for title, values in grouped.items() if values]
+
+
+def _category_sort_positions(product: Product) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for mapping in sorted(product.channel_category_mappings or [], key=lambda item: (item.sales_channel_id, item.position, item.channel_category_id)):
+        category = mapping.channel_category
+        if category is None:
+            continue
+        rows.append(
+            {
+                "sales_channel": mapping.sales_channel.name if mapping.sales_channel else str(mapping.sales_channel_id),
+                "sales_channel_code": mapping.sales_channel.code if mapping.sales_channel else None,
+                "channel_category_id": mapping.channel_category_id,
+                "external_category_id": category.external_category_id,
+                "category_handle": category.external_category_id,
+                "category_path": category.external_path,
+                "position": int(mapping.position if mapping.position is not None else 9999),
+            }
+        )
+    return rows
 
 
 def variant_option_name(variant: ProductVariant) -> str:

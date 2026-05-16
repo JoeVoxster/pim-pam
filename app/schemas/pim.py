@@ -259,6 +259,7 @@ class ProductCategoryMappingUpsert(BaseModel):
     product_id: int
     sales_channel_id: int
     channel_category_id: int
+    position: int | None = None
     is_primary: bool = False
 
 
