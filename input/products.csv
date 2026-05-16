@@ -1,0 +1,3 @@
+supplier_sku,supplier_name,source_url,title_raw,description_raw,brand,ean
+SKU-001,Example Supplier,https://example.com/product-1,Schuh Blau Leder,Robuster Herrenschuh in Blau,Acme,4006381333931
+SKU-002,Generic Supplier,,Jacke Schwarz,Warme Outdoor-Jacke,Northwind,978020137962

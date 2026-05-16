@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Produktimport</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Produktimport</p>
+        <h1>Excel hochladen, Import starten und Ergebnisse direkt pruefen.</h1>
+        <p class="lead">
+          Die Oberflaeche zeigt den Laufstatus live, listet Fehler als Tabelle und stellt alle Export-Dateien direkt zum Download bereit.
+        </p>
+      </section>
+
+      <section class="panel">
+        <form id="import-form" class="form">
+          <label class="field">
+            <span>Importtyp</span>
+            <select name="import_kind" id="import-kind" required>
+              <option value="" selected disabled>Bitte waehlen</option>
+              <option value="supplier_price_list">Lieferantenpreisliste</option>
+              <option value="sales_article_list">Verkaufsartikelliste</option>
+              <option value="magento_1_export">Magento 1.9 Export</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Excel oder CSV</span>
+            <input type="file" id="file-input" name="file" accept=".csv,.xlsx,.xls">
+            <small>Optional, wenn eine Webseiten-URL fuer einen Schnelltest gesetzt ist.</small>
+          </label>
+          <label class="field" id="sheet-field" hidden>
+            <span>Tabellenblatt</span>
+            <select name="sheet_index" id="sheet-select"></select>
+            <small>Nur fuer Excel-Dateien.</small>
+          </label>
+          <label class="field">
+            <span>Webseiten-URL</span>
+            <input
+              type="url"
+              name="website_url"
+              placeholder="https://example.com/produkte"
+            >
+            <small>Optional. Wird fuer leere `source_url`-Felder als Standard verwendet.</small>
+          </label>
+          <label class="field" id="supplier-name-field" hidden>
+            <span>Lieferantenname</span>
+            <input type="text" name="supplier_name" id="supplier-name-input" placeholder="Tintolav">
+          </label>
+          <label class="field" id="purchase-currency-field" hidden>
+            <span>Waehrung</span>
+            <select name="purchase_currency" id="purchase-currency-select">
+              <option value="">Bitte waehlen</option>
+              <option value="EUR">EUR</option>
+              <option value="USD">USD</option>
+              <option value="GBP">GBP</option>
+              <option value="CHF">CHF</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>URL-Modus</span>
+            <select name="source_url_mode">
+              <option value="fill_missing" selected>Nur leere source_url fuellen</option>
+              <option value="overwrite_all">Alle source_url ueberschreiben</option>
+            </select>
+          </label>
+          <details class="advanced">
+            <summary>Erweiterte Parameter und Exportformate</summary>
+            <div class="advanced-grid">
+              <label class="field">
+                <span>Request-Timeout (Sek.)</span>
+                <input type="number" name="request_timeout_seconds" value="15" min="1">
+              </label>
+              <label class="field">
+                <span>Browser Timeout (ms)</span>
+                <input type="number" name="browser_timeout_ms" value="10000" min="1000" step="1000">
+              </label>
+              <label class="field">
+                <span>Max. Bilder pro Produkt</span>
+                <input type="number" name="max_images_per_product" value="20" min="0">
+              </label>
+              <label class="field">
+                <span>Max. PDFs pro Produkt</span>
+                <input type="number" name="max_pdfs_per_product" value="10" min="0">
+              </label>
+              <label class="field">
+                <span>Max. Crawl-Seiten</span>
+                <input type="number" name="max_crawl_pages" value="20" min="1">
+              </label>
+              <label class="field">
+                <span>Log-Level</span>
+                <select name="log_level">
+                  <option value="INFO" selected>INFO</option>
+                  <option value="DEBUG">DEBUG</option>
+                  <option value="WARNING">WARNING</option>
+                  <option value="ERROR">ERROR</option>
+                </select>
+              </label>
+              <label class="field field-wide">
+                <span>User-Agent</span>
+                <input type="text" name="user_agent" value="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36">
+              </label>
+              <div class="field field-wide">
+                <span>Optionen</span>
+                <label class="check"><input type="checkbox" name="headless" value="1" checked> Browser im Headless-Modus starten</label>
+                <label class="check"><input type="checkbox" name="force_crawl" value="1"> Fuer alle Zeilen `crawl_site=true` setzen</label>
+              </div>
+              <div class="field field-wide">
+                <span>Exportformate</span>
+                <div class="checks">
+                  <label class="check"><input type="checkbox" name="export_types" value="products_clean_csv" checked> products_clean.csv</label>
+                  <label class="check"><input type="checkbox" name="export_types" value="products_clean_xlsx" checked> products_clean.xlsx</label>
+                  <label class="check"><input type="checkbox" name="export_types" value="products_medusa_csv" checked> products_medusa_import.csv</label>
+                  <label class="check"><input type="checkbox" name="export_types" value="products_odoo_csv" checked> products_odoo_templates.csv + products_odoo_variants.csv</label>
+                  <label class="check"><input type="checkbox" name="export_types" value="asset_mapping_csv" checked> asset_mapping.csv</label>
+                  <label class="check"><input type="checkbox" name="export_types" value="errors_csv" checked> errors.csv</label>
+                </div>
+              </div>
+            </div>
+          </details>
+          <button type="submit" id="submit-button">Import starten</button>
+          <p id="form-error" class="error-text" hidden></p>
+        </form>
+      </section>
+
+      <section class="grid">
+        <article class="panel status-panel">
+          <div class="section-head">
+            <h2>Status</h2>
+            <span id="status-badge" class="badge idle">Bereit</span>
+          </div>
+          <p id="status-message" class="status-message">Noch kein Lauf gestartet.</p>
+          <div class="progress-card">
+            <div class="progress-meta">
+              <span id="progress-label">0 / 0</span>
+              <span id="progress-percent">0%</span>
+            </div>
+            <div class="progress-bar">
+              <div id="progress-fill"></div>
+            </div>
+          </div>
+          <dl class="stats">
+            <div>
+              <dt>Produkte</dt>
+              <dd id="stat-products">0</dd>
+            </div>
+            <div>
+              <dt>Partials</dt>
+              <dd id="stat-partials">0</dd>
+            </div>
+            <div>
+              <dt>Fehler</dt>
+              <dd id="stat-errors">0</dd>
+            </div>
+          </dl>
+        </article>
+
+        <article class="panel">
+          <div class="section-head">
+            <h2>Downloads</h2>
+          </div>
+          <div id="downloads" class="downloads empty">Nach dem Import erscheinen hier die Export-Dateien.</div>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Aktive Parameter</h2>
+        </div>
+        <div id="active-options" class="parameter-list empty">Noch kein Lauf gestartet.</div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Fehler direkt als Tabelle</h2>
+          <span id="errors-count" class="muted">0 Zeilen</span>
+        </div>
+        <div id="errors-table-wrap" class="table-wrap empty">Noch keine Fehlerdaten vorhanden.</div>
+      </section>
+    </main>
+
+    <script>
+      const form = document.getElementById("import-form");
+      const fileInput = document.getElementById("file-input");
+      const importKind = document.getElementById("import-kind");
+      const sheetField = document.getElementById("sheet-field");
+      const sheetSelect = document.getElementById("sheet-select");
+      const supplierNameField = document.getElementById("supplier-name-field");
+      const supplierNameInput = document.getElementById("supplier-name-input");
+      const purchaseCurrencyField = document.getElementById("purchase-currency-field");
+      const purchaseCurrencySelect = document.getElementById("purchase-currency-select");
+      const formError = document.getElementById("form-error");
+      const submitButton = document.getElementById("submit-button");
+      const websiteUrlInput = document.querySelector('input[name="website_url"]');
+      const statusBadge = document.getElementById("status-badge");
+      const statusMessage = document.getElementById("status-message");
+      const progressLabel = document.getElementById("progress-label");
+      const progressPercent = document.getElementById("progress-percent");
+      const progressFill = document.getElementById("progress-fill");
+      const statProducts = document.getElementById("stat-products");
+      const statPartials = document.getElementById("stat-partials");
+      const statErrors = document.getElementById("stat-errors");
+      const downloads = document.getElementById("downloads");
+      const errorsCount = document.getElementById("errors-count");
+      const errorsTableWrap = document.getElementById("errors-table-wrap");
+      const activeOptions = document.getElementById("active-options");
+
+      let activeJobId = null;
+      let pollHandle = null;
+
+      importKind.addEventListener("change", syncImportKindFields);
+      syncImportKindFields();
+
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files?.[0];
+        if (!file) {
+          resetSheets();
+          return;
+        }
+        const isExcel = file.name.toLowerCase().endsWith(".xlsx") || file.name.toLowerCase().endsWith(".xls");
+        if (!isExcel) {
+          resetSheets();
+          return;
+        }
+        const data = new FormData();
+        data.append("file", file);
+        const response = await fetch("/api/input-sheets", { method: "POST", body: data });
+        const payload = await response.json();
+        const sheets = payload.sheets || [];
+        if (sheets.length === 0) {
+          resetSheets();
+          return;
+        }
+        sheetSelect.innerHTML = sheets
+          .map((sheet) => `<option value="${sheet.index}" ${sheet.index === 0 ? "selected" : ""}>${escapeHtml(`${sheet.index + 1}. ${sheet.name}`)}</option>`)
+          .join("");
+        sheetField.hidden = false;
+      });
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        formError.hidden = true;
+        if (!validateImportKind()) {
+          return;
+        }
+        submitButton.disabled = true;
+        submitButton.textContent = "Startet...";
+
+        const data = new FormData(form);
+        try {
+          const response = await fetch("/api/jobs", { method: "POST", body: data });
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.error || "Import konnte nicht gestartet werden.");
+          }
+          activeJobId = payload.job_id;
+          renderJob(payload);
+          startPolling();
+        } catch (error) {
+          formError.textContent = error.message;
+          formError.hidden = false;
+        } finally {
+          submitButton.disabled = false;
+          submitButton.textContent = "Import starten";
+        }
+      });
+
+      function startPolling() {
+        if (pollHandle) {
+          clearInterval(pollHandle);
+        }
+        pollHandle = setInterval(async () => {
+          if (!activeJobId) {
+            return;
+          }
+          const response = await fetch(`/api/jobs/${activeJobId}`);
+          if (!response.ok) {
+            clearInterval(pollHandle);
+            return;
+          }
+          const payload = await response.json();
+          renderJob(payload);
+          if (payload.status === "completed" || payload.status === "failed") {
+            clearInterval(pollHandle);
+          }
+        }, 1200);
+      }
+
+      function renderJob(job) {
+        const total = Number(job.total || 0);
+        const current = Number(job.current || 0);
+        const percent = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
+        statusBadge.textContent = badgeLabel(job.status);
+        statusBadge.className = `badge ${job.status}`;
+        statusMessage.textContent = job.error ? `${job.message}: ${job.error}` : (job.message || "Import laeuft");
+        progressLabel.textContent = `${current} / ${total}`;
+        progressPercent.textContent = `${percent}%`;
+        progressFill.style.width = `${percent}%`;
+        statProducts.textContent = job.summary?.products ?? 0;
+        statPartials.textContent = job.summary?.partials ?? 0;
+        statErrors.textContent = job.summary?.errors ?? 0;
+        renderDownloads(job);
+        renderOptions(job.options || {});
+        renderErrors(job.errors_table || { columns: [], rows: [], total_rows: 0 });
+      }
+
+      function renderDownloads(job) {
+        if (!job.downloads || job.downloads.length === 0) {
+          downloads.className = "downloads empty";
+          downloads.textContent = "Nach dem Import erscheinen hier die Export-Dateien.";
+          return;
+        }
+        downloads.className = "downloads";
+        downloads.innerHTML = job.downloads
+          .map((file) => `<a class="download-link" href="/download/${job.job_id}/${file.relative_path}">${file.name}</a>`)
+          .join("");
+      }
+
+      function renderErrors(table) {
+        errorsCount.textContent = `${table.total_rows || 0} Zeilen`;
+        if (!table.columns || table.columns.length === 0) {
+          errorsTableWrap.className = "table-wrap empty";
+          errorsTableWrap.textContent = "Noch keine Fehlerdaten vorhanden.";
+          return;
+        }
+        const header = `<tr>${table.columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr>`;
+        const body = table.rows.length
+          ? table.rows.map((row) => `<tr>${table.columns.map((column) => `<td>${escapeHtml(row[column] || "")}</td>`).join("")}</tr>`).join("")
+          : `<tr><td colspan="${table.columns.length}">Keine Fehler.</td></tr>`;
+        errorsTableWrap.className = "table-wrap";
+        errorsTableWrap.innerHTML = `<table><thead>${header}</thead><tbody>${body}</tbody></table>`;
+      }
+
+      function renderOptions(options) {
+        const settings = options.settings || {};
+        const exportTypes = options.export_types || [];
+        const items = [
+          ["Importtyp", formatImportKind(options.import_kind)],
+          ["Lieferantenname", options.supplier_name || "-"],
+          ["Waehrung", options.purchase_currency || "-"],
+          ["Tabellenblatt", formatSheetOption(options)],
+          ["URL-Modus", options.source_url_mode || "fill_missing"],
+          ["Force Crawl", options.force_crawl ? "ja" : "nein"],
+          ["Request-Timeout", `${settings.request_timeout_seconds ?? "-"} s`],
+          ["Browser Timeout", `${settings.browser_timeout_ms ?? "-"} ms`],
+          ["Max. Bilder", settings.max_images_per_product ?? "-"],
+          ["Max. PDFs", settings.max_pdfs_per_product ?? "-"],
+          ["Max. Crawl-Seiten", settings.max_crawl_pages ?? "-"],
+          ["Headless", settings.headless ? "ja" : "nein"],
+          ["Log-Level", settings.log_level ?? "-"],
+          ["User-Agent", settings.user_agent ?? "-"],
+          ["Exporte", exportTypes.join(", ") || "-"],
+        ];
+        activeOptions.className = "parameter-list";
+        activeOptions.innerHTML = items
+          .map(([label, value]) => `<div class="parameter-item"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(String(value))}</span></div>`)
+          .join("");
+      }
+
+      function badgeLabel(status) {
+        if (status === "running") return "Laeuft";
+        if (status === "completed") return "Fertig";
+        if (status === "failed") return "Fehlgeschlagen";
+        return "Bereit";
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function resetSheets() {
+        sheetField.hidden = true;
+        sheetSelect.innerHTML = "";
+      }
+
+      function syncImportKindFields() {
+        const supplierMode = importKind.value === "supplier_price_list";
+        const magentoMode = importKind.value === "magento_1_export";
+        supplierNameField.hidden = !supplierMode;
+        purchaseCurrencyField.hidden = !supplierMode;
+        supplierNameInput.required = supplierMode;
+        purchaseCurrencySelect.required = supplierMode;
+        websiteUrlInput.required = magentoMode;
+      }
+
+      function validateImportKind() {
+        if (!importKind.value) {
+          formError.textContent = "Bitte einen Importtyp auswaehlen.";
+          formError.hidden = false;
+          return false;
+        }
+        if (!fileInput.files?.length && !websiteUrlInput.value.trim()) {
+          formError.textContent = "Bitte eine Datei hochladen oder eine Webseiten-URL angeben.";
+          formError.hidden = false;
+          return false;
+        }
+        if (importKind.value === "supplier_price_list" && (!supplierNameInput.value.trim() || !purchaseCurrencySelect.value)) {
+          formError.textContent = "Bei Lieferantenpreislisten sind Lieferantenname und Waehrung Pflicht.";
+          formError.hidden = false;
+          return false;
+        }
+        if (importKind.value === "magento_1_export") {
+          if (!fileInput.files?.length) {
+            formError.textContent = "Beim Magento-1.9-Export ist eine Datei Pflicht.";
+            formError.hidden = false;
+            return false;
+          }
+          if (!websiteUrlInput.value.trim()) {
+            formError.textContent = "Beim Magento-1.9-Export ist die Webseiten-URL als Basis fuer Produkt- und Asset-Links Pflicht.";
+            formError.hidden = false;
+            return false;
+          }
+        }
+        return true;
+      }
+
+      function formatImportKind(value) {
+        if (value === "supplier_price_list") return "Lieferantenpreisliste";
+        if (value === "sales_article_list") return "Verkaufsartikelliste";
+        if (value === "magento_1_export") return "Magento 1.9 Export";
+        return "-";
+      }
+
+      function formatSheetOption(options) {
+        if (options.sheet_index === null || options.sheet_index === undefined) {
+          return options.sheet_name || "1. Blatt";
+        }
+        const label = `${Number(options.sheet_index) + 1}. Blatt`;
+        return options.sheet_name ? `${label} (${options.sheet_name})` : label;
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,14 @@
+supplier_name: Example Supplier
+default_currency: EUR
+category_separator: ">"
+category_columns:
+  - category
+  - categories
+  - Kategorie
+  - Warengruppe
+stock_column: stock_qty
+price_column_candidates:
+  - sales_price
+  - purchase_price
+  - Preis
+  - price

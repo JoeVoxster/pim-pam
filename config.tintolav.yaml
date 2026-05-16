@@ -1,0 +1,5 @@
+request_timeout_seconds: 30
+browser_timeout_ms: 30000
+headless: true
+log_level: INFO
+max_crawl_pages: 1200

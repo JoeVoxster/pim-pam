@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: pimdb
+      POSTGRES_USER: pim
+      POSTGRES_PASSWORD: pim
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  app:
+    image: python:3.12-slim
+    working_dir: /workspace
+    command: bash -lc "pip install -r requirements.txt && python -m app.ui.dash_app"
+    env_file:
+      - .env
+    volumes:
+      - .:/workspace
+      - asset_data:/workspace/data/assets
+    ports:
+      - "8050:8050"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
+  asset_data:
