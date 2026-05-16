@@ -194,7 +194,7 @@ class MedusaSyncService:
             )
             self._sync_translations(run, client, config, product, translation_mapper, dry_run=dry_run)
 
-        status = "success" if not any(item.status == "error" for item in run.items) else "partial_success"
+        status = "success" if not any(item.status in {"error", "validation_error"} for item in run.items) else "partial_success"
         self._finish_run(run, status, self._summary(run))
         return {"status": status, "run_id": run.id, "summary": run.summary}
 
@@ -306,6 +306,17 @@ class MedusaSyncService:
                 continue
             translation = _variant_translation_for(variant, config.default_locale)
             mapped = variant_mapper.map_variant(variant, translation=translation)
+            try:
+                prices = pricing_mapper.variant_prices(variant)
+            except Exception as exc:
+                self._add_item(run, "price", variant.id, "error", "validation_error", error_message=str(exc))
+                prices = []
+            if not prices:
+                message = f"Variante {variant.id} nicht exportiert: Verkaufspreis fehlt."
+                self._add_item(run, "variant", variant.id, "skip", "validation_error", request_payload=mapped.payload, error_message=message)
+                continue
+            mapped.payload["prices"] = prices
+            mapped = type(mapped)(local_id=mapped.local_id, payload=mapped.payload, hash=stable_hash(mapped.payload), sku=mapped.sku)
             mapping = self._mapping(config, "variant", variant.id)
             action = self._planned_action(mapping, mapped.hash, force=force)
             if not variant.sku and "sku" in (config.variant_match_policy or ""):
@@ -321,7 +332,7 @@ class MedusaSyncService:
                 except Exception as exc:
                     self._add_item(run, "variant", variant.id, "error", "error", request_payload=mapped.payload, error_message=str(exc))
                     continue
-            self._sync_prices(run, client, config, variant, pricing_mapper, dry_run=dry_run, medusa_product_id=medusa_product_id, medusa_variant_id=medusa_variant_id)
+            self._sync_prices(run, client, config, variant, pricing_mapper, dry_run=dry_run, medusa_product_id=medusa_product_id, medusa_variant_id=medusa_variant_id, prices=prices)
 
     def _upsert_variant(
         self,
@@ -377,14 +388,16 @@ class MedusaSyncService:
         dry_run: bool,
         medusa_product_id: str | None,
         medusa_variant_id: str | None,
+        prices: list[dict[str, Any]] | None = None,
     ) -> None:
         if not config.export_default_prices and not config.export_tiered_prices:
             return
-        try:
-            prices = pricing_mapper.variant_prices(variant)
-        except Exception as exc:
-            self._add_item(run, "price", variant.id, "error", "validation_error", error_message=str(exc))
-            return
+        if prices is None:
+            try:
+                prices = pricing_mapper.variant_prices(variant)
+            except Exception as exc:
+                self._add_item(run, "price", variant.id, "error", "validation_error", error_message=str(exc))
+                return
         payload = {"prices": prices}
         payload_hash = stable_hash(payload)
         mapping = self._mapping(config, "price", variant.id, currency_code=(variant.currency or config.default_currency_code or "CHF").upper())

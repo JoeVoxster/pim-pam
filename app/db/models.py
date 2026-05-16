@@ -239,6 +239,7 @@ class ProductCategoryAssignment(TimestampMixin, Base):
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
     category_id: Mapped[int] = mapped_column(ForeignKey("categories.id", ondelete="CASCADE"), nullable=False)
     sales_channel_id: Mapped[int] = mapped_column(ForeignKey("sales_channels.id", ondelete="CASCADE"), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     product: Mapped[Product] = relationship(back_populates="category_links")
     category: Mapped[Category] = relationship(back_populates="product_links")

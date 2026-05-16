@@ -186,6 +186,7 @@ from app.services.pim_service import (
     list_translation_overview,
     list_variant_translation_overview,
     get_products_for_channel_category,
+    move_products_to_category,
     upsert_channel_category,
     upsert_product_category_mapping,
     upsert_product_channel_listing,
@@ -423,7 +424,7 @@ BULK_EDIT_PREVIEW_COLUMNS = [
 CATEGORY_COLUMNS = [
     {"field": "id", "maxWidth": 90, "sortable": False},
     {"field": "tree_toggle", "headerName": "", "maxWidth": 70, "editable": False, "sortable": False, "filter": False, "cellRenderer": "CategoryToggleButton"},
-    {"field": "tree_name", "headerName": "Kategorienbaum", "flex": 1.8, "minWidth": 360, "editable": False, "sortable": False, "filter": True},
+    {"field": "tree_name", "headerName": "Kategorienbaum", "flex": 1.8, "minWidth": 360, "editable": False, "sortable": False, "filter": True, "cellRenderer": "CategoryDropTargetCell"},
     {"field": "sort_order", "headerName": "#", "maxWidth": 90, "editable": True, "sortable": False},
     {"field": "parent_id", "headerName": "Parent", "maxWidth": 120, "editable": True, "sortable": False},
     {
@@ -652,8 +653,10 @@ CHANNEL_CATEGORY_TREE_COLUMNS = [
 ]
 CHANNEL_CATEGORY_PRODUCT_COLUMNS = [
     {"field": "id", "maxWidth": 90},
+    {"field": "sort_order", "headerName": "#", "maxWidth": 80},
     {"field": "sku", "headerName": "SKU", "minWidth": 150},
-    {"field": "title", "headerName": "Produkt", "flex": 1.5, "minWidth": 260},
+    {"field": "photo_asset_id", "headerName": "Bild", "maxWidth": 90, "editable": False, "filter": False, "sortable": False, "cellRenderer": "ProductPhotoCell"},
+    {"field": "title", "headerName": "Produkt", "flex": 1.5, "minWidth": 260, "cellRenderer": "ProductCategoryDragCell"},
     {"field": "brand", "headerName": "Marke", "minWidth": 140},
     {"field": "variant_count", "headerName": "Varianten", "maxWidth": 120},
     {"field": "status", "headerName": "Status", "maxWidth": 120},
@@ -720,6 +723,9 @@ RULE_COLUMNS = [
 DETAIL_VARIANT_COLUMNS = [
     {"field": "id", "maxWidth": 90},
     {"field": "sku"},
+    {"field": "medusa_id", "headerName": "Medusa Variant ID", "minWidth": 190},
+    {"field": "medusa_mapping_status", "headerName": "Medusa Status", "minWidth": 140},
+    {"field": "medusa_last_synced_at", "headerName": "Letzter Medusa Sync", "minWidth": 190},
     {"field": "variant_title", "flex": 1.8, "minWidth": 320},
     {"field": "option_name", "headerName": "Attribut"},
     {"field": "option_value", "headerName": "Wert"},
@@ -1092,6 +1098,42 @@ def _int_or_none(value: object) -> int | None:
 
 def _selected_ids(rows: list[dict] | None) -> list[int]:
     return [int(row["id"]) for row in (rows or []) if row.get("id") is not None]
+
+
+def _category_id_from_grid_state(
+    stored_category_id: int | str | None,
+    selected_rows: list[dict] | None = None,
+    cell_event: dict | None = None,
+) -> int | None:
+    for value in (
+        stored_category_id,
+        ((selected_rows or [{}])[0] or {}).get("id") if selected_rows else None,
+        ((cell_event or {}).get("data") or {}).get("id") if cell_event else None,
+    ):
+        if value in {None, ""}:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _reordered_product_ids_for_drop(
+    product_rows: list[dict] | None,
+    dragged_product_ids: list[int],
+    target_product_id: int,
+    position: str | None,
+) -> list[int]:
+    row_ids = [int(row["id"]) for row in (product_rows or []) if row.get("id") is not None]
+    dragged = [int(item) for item in dragged_product_ids if int(item) in set(row_ids)]
+    if not dragged or int(target_product_id) not in set(row_ids):
+        return row_ids
+    remaining = [item for item in row_ids if item not in set(dragged)]
+    insert_index = remaining.index(int(target_product_id)) if int(target_product_id) in remaining else len(remaining)
+    if position == "after":
+        insert_index += 1
+    return remaining[:insert_index] + dragged + remaining[insert_index:]
 
 
 def _bulk_action_options(context: str | None) -> list[dict]:
@@ -4012,7 +4054,7 @@ def create_dash_app() -> Dash:
                                                 [
                                                     html.Div(
                                                         [
-                                                            html.H4("Stammdaten"),
+                                                            html.H4("Stammdaten / Medusa Mapping"),
                                                             html.Div(id="product-detail-summary", className="detail-summary-grid"),
                                                         ],
                                                         className="panel",
@@ -5230,14 +5272,24 @@ def create_dash_app() -> Dash:
                                             html.Div(
                                                 [
                                                     html.H4("Produkte dieser Kategorie"),
+                                                    html.Div(
+                                                        "Produkte am Titel greifen und auf eine Zielkategorie im Baum ziehen.",
+                                                        className="category-tree-description",
+                                                    ),
                                                     html.Div(id="category-products-status", className="selection-summary"),
                                                     html.Div(id="category-breadcrumb", className="category-tree-description"),
-                                                    grid("category-products-grid", CHANNEL_CATEGORY_PRODUCT_COLUMNS, height="520px"),
+                                                    grid(
+                                                        "category-products-grid",
+                                                        CHANNEL_CATEGORY_PRODUCT_COLUMNS,
+                                                        height="520px",
+                                                        row_selection="multiple",
+                                                        extra_grid_options={"animateRows": True},
+                                                    ),
                                                 ],
                                                 className="panel",
                                             ),
                                         ],
-                                        className="detail-columns",
+                                        className="category-browser-layout",
                                     ),
                                 ],
                                 className="panel",
@@ -8730,6 +8782,8 @@ def register_callbacks(app: Dash) -> None:
         Output("category-products-status", "children"),
         Output("category-breadcrumb", "children"),
         Input("selected-category-id", "data"),
+        Input("categories-grid", "selectedRows"),
+        Input("categories-grid", "cellClicked"),
         Input("categories-sales-channel-code", "value"),
         Input("refresh-token", "data"),
     )
@@ -8737,11 +8791,14 @@ def register_callbacks(app: Dash) -> None:
     def load_products_for_selected_category(
         session: Session,
         category_id: int | None,
+        selected_rows: list[dict] | None,
+        cell_event: dict | None,
         sales_channel_code: str | None,
         _refresh_token: int | None,
     ):
         if not sales_channel_code:
             return [], "Bitte zuerst Vertriebskanal auswählen.", ""
+        category_id = _category_id_from_grid_state(category_id, selected_rows, cell_event)
         if not category_id:
             return [], "Bitte Kategorie im Baum auswählen.", ""
         detail = get_category_detail(session, int(category_id), sales_channel_code=sales_channel_code or DEFAULT_CATEGORY_CHANNEL_CODE)
@@ -9246,6 +9303,95 @@ def register_callbacks(app: Dash) -> None:
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),
         Output("refresh-token", "data", allow_duplicate=True),
+        Output("category-products-grid", "selectedRows", allow_duplicate=True),
+        Input("category-products-grid", "cellRendererData"),
+        State("selected-category-id", "data"),
+        State("category-products-grid", "rowData"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def reorder_category_products_by_drag(
+        session: Session,
+        renderer_data: dict | None,
+        category_id: int | None,
+        product_rows: list[dict] | None,
+        refresh_token: int | None,
+    ):
+        value = (renderer_data or {}).get("value") or {}
+        if value.get("action") != "reorder_products_in_category":
+            return no_update, no_update, no_update
+        if not category_id:
+            return "Bitte zuerst Kategorie auswählen.", no_update, no_update
+        product_ids = [int(item) for item in (value.get("product_ids") or [])]
+        target_product_id = _safe_int(value.get("target_product_id"))
+        if not product_ids or not target_product_id:
+            return "Keine Produktposition für Sortierung erkannt.", no_update, no_update
+        ordered_ids = _reordered_product_ids_for_drop(product_rows, product_ids, target_product_id, value.get("position"))
+        move_products_to_category(
+            session,
+            product_ids,
+            int(category_id),
+            source_category_id=int(category_id),
+            ordered_product_ids=ordered_ids,
+        )
+        return "Reihenfolge der Produkte aktualisiert.", (refresh_token or 0) + 1, []
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Output("categories-grid", "selectedRows", allow_duplicate=True),
+        Output("selected-category-id", "data", allow_duplicate=True),
+        Output("category-products-grid", "selectedRows", allow_duplicate=True),
+        Input("categories-grid", "cellRendererData"),
+        State("selected-category-id", "data"),
+        State("category-products-grid", "rowData"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def move_category_products_by_drag(
+        session: Session,
+        renderer_data: dict | None,
+        source_category_id: int | None,
+        product_rows: list[dict] | None,
+        refresh_token: int | None,
+    ):
+        value = (renderer_data or {}).get("value") or {}
+        if value.get("action") != "move_products_to_category":
+            return no_update, no_update, no_update, no_update, no_update
+        product_ids = value.get("product_ids") or []
+        target_category_id = value.get("category_id")
+        if not product_ids or not target_category_id:
+            return "Keine Produkte oder Ziel-Kategorie für Verschieben erkannt.", no_update, no_update, no_update, no_update
+        try:
+            dragged_product_ids = [int(item) for item in product_ids]
+            ordered_ids = [int(row["id"]) for row in (product_rows or []) if row.get("id") is not None]
+            if source_category_id and int(source_category_id) == int(target_category_id) and dragged_product_ids:
+                ordered_ids = [item for item in ordered_ids if item not in set(dragged_product_ids)]
+                ordered_ids = dragged_product_ids + ordered_ids
+            result = move_products_to_category(
+                session,
+                dragged_product_ids,
+                int(target_category_id),
+                source_category_id=int(source_category_id) if source_category_id else None,
+                ordered_product_ids=ordered_ids,
+            )
+        except ValueError as exc:
+            return str(exc), no_update, no_update, no_update, no_update
+        moved = int(result.get("moved") or 0)
+        target_name = result.get("target_category_name") or result.get("target_category_id")
+        return (
+            f"{moved} Produkt(e) nach {target_name} verschoben.",
+            no_update if not moved else (refresh_token or 0) + 1,
+            no_update,
+            int(target_category_id),
+            [],
+        )
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
         Input("categories-grid", "cellValueChanged"),
         State("categories-sales-channel-code", "value"),
         State("refresh-token", "data"),
@@ -9367,6 +9513,9 @@ def register_callbacks(app: Dash) -> None:
                 html.Div(f"Family Key: {detail.get('family_key') or '-'}"),
                 html.Div(f"Originalsprache: {detail.get('source_language') or '-'}"),
                 html.Div(f"Handle: {detail['handle']}"),
+                html.Div(f"Medusa Product ID: {detail.get('medusa_id') or '-'}"),
+                html.Div(f"Medusa Mapping: {detail.get('medusa_mapping_status') or 'not_mapped'}"),
+                html.Div(f"Letzter Medusa Sync: {detail.get('medusa_last_synced_at') or '-'}"),
                 html.Div(f"Kategorie-Sets pro Kanal: {category_summary_text}"),
                 html.Div(f"Source URL: {detail.get('source_url') or '-'}"),
                 html.Div(f"Final URL: {detail.get('source_url_final') or '-'}"),
@@ -13351,6 +13500,7 @@ def configure_dash_app(app: Dash) -> Dash:
           .category-form-row { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) minmax(180px, 220px); gap: 12px; }
           .category-form-row--compact { grid-template-columns: 180px 180px; }
           .category-form-card label { display: block; font-size: 12px; font-weight: 700; color: #4b5563; margin-bottom: 4px; }
+          .category-browser-layout { display: grid; grid-template-columns: minmax(320px, 0.85fr) minmax(560px, 1.65fr); gap: 12px; margin-top: 12px; align-items: start; }
           .button-row { display: flex; gap: 8px; }
           .detail-columns { display: grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap: 12px; margin-top: 12px; }
           .translation-layout { display: grid; gap: 12px; }
@@ -13416,7 +13566,7 @@ def configure_dash_app(app: Dash) -> Dash:
           @keyframes crawler-spin { to { transform: rotate(360deg); } }
           input, textarea { padding: 8px; border: 1px solid #c7ccd8; border-radius: 4px; }
           button { padding: 8px 12px; border: 1px solid #1f2937; background: white; border-radius: 4px; cursor: pointer; }
-          @media (max-width: 960px) { .page-header, .page-body, .metrics, .detail-columns, .detail-summary-grid, .variant-editor-layout, .variant-form-row, .variant-form-row--wide, .variant-form-row--compact, .category-form-row, .category-form-row--compact, .translation-row, .crawler-source-grid, .crawler-options-grid, .crawler-result-grid, .unified-enrichment-grid { grid-template-columns: 1fr; } .page-header { display: grid; } .sidebar-shell { position: static; } .page-body-collapsed { grid-template-columns: 1fr; } .crawler-modal-header { display: grid; } .crawler-field-wide { grid-column: auto; } }
+          @media (max-width: 960px) { .page-header, .page-body, .metrics, .detail-columns, .category-browser-layout, .detail-summary-grid, .variant-editor-layout, .variant-form-row, .variant-form-row--wide, .variant-form-row--compact, .category-form-row, .category-form-row--compact, .translation-row, .crawler-source-grid, .crawler-options-grid, .crawler-result-grid, .unified-enrichment-grid { grid-template-columns: 1fr; } .page-header { display: grid; } .sidebar-shell { position: static; } .page-body-collapsed { grid-template-columns: 1fr; } .crawler-modal-header { display: grid; } .crawler-field-wide { grid-column: auto; } }
         </style>
       </head>
       <body>

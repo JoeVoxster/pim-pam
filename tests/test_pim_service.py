@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
-from app.db.models import Asset, ChemicalDocument
+from app.db.models import Asset, ChemicalDocument, MedusaConnectionConfig, MedusaSyncMapping
 from app.services.asset_service import create_asset_record
 from app.schemas.pim import (
     ChannelCategoryUpsert,
@@ -45,6 +45,7 @@ from app.services.pim_service import (
     get_product_detail,
     get_products_for_category,
     get_products_for_channel_category,
+    move_products_to_category,
     get_product_sdb,
     get_category_detail,
     archive_variants,
@@ -199,6 +200,55 @@ def test_pim_service_create_and_update_product(tmp_path) -> None:
     assert detail["variants"][0]["price_tiers"][1]["margin_percent"] == 58.31
     assert len(chemistry_rows) == 1
     assert chemistry_rows[0]["cas_number"] == "7681-52-9"
+
+
+def test_product_detail_includes_readonly_medusa_mapping_ids(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, variant = create_product(
+            session,
+            ProductCreate(sku="MEDUSA-1", title="Medusa Product", status="active"),
+            VariantCreate(sku="MEDUSA-1-A", variant_title="Default"),
+        )
+        connection = MedusaConnectionConfig(name="default", base_url="https://medusa.example", admin_path="/admin")
+        session.add(connection)
+        session.flush()
+        session.add_all(
+            [
+                MedusaSyncMapping(
+                    connection_id=connection.id,
+                    entity_type="product",
+                    local_entity_id=product.id,
+                    medusa_id="prod_123",
+                    medusa_handle="medusa-product",
+                    status="active",
+                ),
+                MedusaSyncMapping(
+                    connection_id=connection.id,
+                    entity_type="variant",
+                    local_entity_id=variant.id,
+                    local_parent_id=product.id,
+                    medusa_id="variant_123",
+                    medusa_parent_id="prod_123",
+                    medusa_sku="MEDUSA-1-A",
+                    status="active",
+                ),
+            ]
+        )
+        session.commit()
+
+        detail = get_product_detail(session, product.id)
+
+    assert detail["medusa_id"] == "prod_123"
+    assert detail["medusa_handle"] == "medusa-product"
+    assert detail["medusa_mapping_status"] == "active"
+    assert detail["variants"][0]["medusa_id"] == "variant_123"
+    assert detail["variants"][0]["medusa_parent_id"] == "prod_123"
+    assert detail["variants"][0]["medusa_sku"] == "MEDUSA-1-A"
+    assert detail["variants"][0]["medusa_mapping_status"] == "active"
 
 
 def test_set_product_translation_short_description_preserves_existing_translation_fields(tmp_path) -> None:
@@ -1347,6 +1397,70 @@ def test_internal_channel_category_products_include_descendant_assignments(tmp_p
 
     assert [row["id"] for row in root_products] == [product.id]
     assert root_direct_products == []
+
+
+def test_move_products_to_category_replaces_source_subtree_assignment(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        ensure_default_sales_channels(session)
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="MOVE-CAT-1", title="Move Category Product", brand_name="VOXSTER", status="ready"),
+            VariantCreate(sku="MOVE-CAT-1-A", variant_title="A"),
+        )
+        source_root = create_category(session, "Source Root", None, "de", 1, sales_channel_code="voxster")
+        source_child = create_category(session, "Source Child", source_root.id, "de", 1, sales_channel_code="voxster")
+        target = create_category(session, "Target", None, "de", 2, sales_channel_code="voxster")
+        set_product_categories_for_channel(session, product, [source_child.id], "voxster")
+        session.commit()
+
+        result = move_products_to_category(session, [product.id], target.id, source_category_id=source_root.id)
+        session.commit()
+        source_products = get_products_for_category(session, source_root.id)
+        target_products = get_products_for_category(session, target.id)
+
+    assert result["moved"] == 1
+    assert source_products == []
+    assert [row["id"] for row in target_products] == [product.id]
+
+
+def test_move_products_to_same_category_updates_sort_order(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        ensure_default_sales_channels(session)
+        product_a, _variant_a = create_product(
+            session,
+            ProductCreate(sku="ORDER-CAT-A", title="A Product", brand_name="VOXSTER", status="ready"),
+            VariantCreate(sku="ORDER-CAT-A-1", variant_title="A"),
+        )
+        product_b, _variant_b = create_product(
+            session,
+            ProductCreate(sku="ORDER-CAT-B", title="B Product", brand_name="VOXSTER", status="ready"),
+            VariantCreate(sku="ORDER-CAT-B-1", variant_title="B"),
+        )
+        category = create_category(session, "Order Category", None, "de", 1, sales_channel_code="voxster")
+        set_product_categories_for_channel(session, product_a, [category.id], "voxster")
+        set_product_categories_for_channel(session, product_b, [category.id], "voxster")
+        session.commit()
+
+        move_products_to_category(
+            session,
+            [product_b.id],
+            category.id,
+            source_category_id=category.id,
+            ordered_product_ids=[product_b.id, product_a.id],
+        )
+        session.commit()
+        products = get_products_for_category(session, category.id)
+
+    assert [row["id"] for row in products] == [product_b.id, product_a.id]
+    assert [row["sort_order"] for row in products] == [0, 1]
 
 
 def test_bulk_update_products_supports_preview_apply_and_backup(tmp_path) -> None:

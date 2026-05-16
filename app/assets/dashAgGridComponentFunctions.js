@@ -34,6 +34,120 @@ dagcomponentfuncs.CategoryToggleButton = function (props) {
     );
 };
 
+dagcomponentfuncs.CategoryDropTargetCell = function (props) {
+    const value = props.value || '';
+    const onDragOver = function (event) {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+    };
+    const onDrop = function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        let payload = null;
+        try {
+            payload = JSON.parse(event.dataTransfer.getData('application/json') || '{}');
+        } catch (error) {
+            payload = null;
+        }
+        const productIds = payload && Array.isArray(payload.product_ids) ? payload.product_ids : [];
+        if (!productIds.length || !props.setData || !props.data || !props.data.id) {
+            return;
+        }
+        props.setData({
+            action: 'move_products_to_category',
+            category_id: props.data.id,
+            product_ids: productIds,
+            ts: Date.now()
+        });
+    };
+    return React.createElement(
+        'span',
+        {
+            onDragOver: onDragOver,
+            onDrop: onDrop,
+            title: 'Produkte hierher verschieben',
+            style: {
+                display: 'block',
+                minHeight: '28px',
+                lineHeight: '28px',
+                padding: '0 4px'
+            }
+        },
+        value
+    );
+};
+
+
+dagcomponentfuncs.ProductCategoryDragCell = function (props) {
+    const value = props.value || '';
+    const dragPayload = function () {
+        const selectedRows = props.api && props.api.getSelectedRows ? props.api.getSelectedRows() : [];
+        let rows = selectedRows && selectedRows.length ? selectedRows : [props.data || {}];
+        const draggedId = props.data && props.data.id;
+        if (draggedId && !rows.some(function (row) { return row && row.id === draggedId; })) {
+            rows = [props.data || {}];
+        }
+        const productIds = rows
+            .map(function (row) { return row && row.id; })
+            .filter(function (id) { return id !== null && id !== undefined && id !== ''; });
+        return {product_ids: productIds};
+    };
+    const onDragStart = function (event) {
+        const payload = dragPayload();
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('application/json', JSON.stringify(payload));
+        event.dataTransfer.setData('text/plain', payload.product_ids.join(','));
+    };
+    const onDragOver = function (event) {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+    };
+    const onDrop = function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        let payload = null;
+        try {
+            payload = JSON.parse(event.dataTransfer.getData('application/json') || '{}');
+        } catch (error) {
+            payload = null;
+        }
+        const productIds = payload && Array.isArray(payload.product_ids) ? payload.product_ids : [];
+        const targetId = props.data && props.data.id;
+        if (!productIds.length || !targetId || !props.setData) {
+            return;
+        }
+        const rect = event.currentTarget.getBoundingClientRect();
+        const position = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
+        props.setData({
+            action: 'reorder_products_in_category',
+            target_product_id: targetId,
+            product_ids: productIds,
+            position: position,
+            ts: Date.now()
+        });
+    };
+    return React.createElement(
+        'span',
+        {
+            draggable: true,
+            onDragStart: onDragStart,
+            onDragOver: onDragOver,
+            onDrop: onDrop,
+            title: 'Produkt ziehen: auf Kategorie verschieben oder auf Produktposition einsortieren',
+            style: {
+                cursor: 'grab',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                minHeight: '28px',
+                width: '100%'
+            }
+        },
+        React.createElement('span', {style: {color: '#64748b', fontWeight: 700}}, '↕'),
+        React.createElement('span', null, value)
+    );
+};
+
 
 dagcomponentfuncs.ProductTitleButton = function (props) {
     const value = props.value || '';

@@ -2,8 +2,10 @@ import base64
 
 from app.ui.dash_app import (
     _channel_bulk_category_dropdown_state,
+    _category_id_from_grid_state,
     _dedupe_group_selection_state,
     _dedupe_select_group_rows,
+    _reordered_product_ids_for_drop,
     create_dash_app,
     save_uploaded_import_file,
 )
@@ -58,6 +60,9 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "channel-bulk-sales-channel-id" in layout_repr
     assert "channel-bulk-channel-category-id" in layout_repr
     assert "channel-bulk-category-status" in layout_repr
+    assert "ProductCategoryDragCell" in layout_repr
+    assert "CategoryDropTargetCell" in layout_repr
+    assert "category-browser-layout" in layout_repr
     assert "product-select-all-button" in layout_repr
     assert "product-select-filtered-button" in layout_repr
     assert "product-select-page-button" in layout_repr
@@ -81,6 +86,9 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "product-detail-category-mappings" in layout_repr
     assert "product-detail-variant-channel-listings" in layout_repr
     assert "product-detail-variant-category-mappings" in layout_repr
+    assert "Stammdaten / Medusa Mapping" in layout_repr
+    assert "Medusa Variant ID" in layout_repr
+    assert "Medusa Status" in layout_repr
     assert "Produktdetail" not in layout_repr
     assert "Beschreibung" in layout_repr
     assert "product-short-description" in layout_repr
@@ -233,6 +241,21 @@ def test_channel_bulk_category_dropdown_handles_invalid_channel_id() -> None:
     assert value is None
     assert disabled is True
     assert "ungültige Vertriebskanal-ID" in message
+
+
+def test_category_id_from_grid_state_uses_selected_row_or_cell_event() -> None:
+    assert _category_id_from_grid_state(None, [{"id": "78"}], None) == 78
+    assert _category_id_from_grid_state(None, [], {"data": {"id": 78}}) == 78
+    assert _category_id_from_grid_state("78", [], None) == 78
+    assert _category_id_from_grid_state(None, [{"id": "bad"}], {"data": {"id": "79"}}) == 79
+
+
+def test_reordered_product_ids_for_drop_inserts_before_or_after_target() -> None:
+    rows = [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+    assert _reordered_product_ids_for_drop(rows, [4], 2, "before") == [1, 4, 2, 3]
+    assert _reordered_product_ids_for_drop(rows, [1], 3, "after") == [2, 3, 1, 4]
+    assert _reordered_product_ids_for_drop(rows, [2, 3], 4, "after") == [1, 4, 2, 3]
 
 
 def test_dedupe_group_deselect_removes_only_group_products() -> None:

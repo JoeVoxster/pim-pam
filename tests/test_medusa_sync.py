@@ -340,13 +340,55 @@ def test_export_writes_medusa_mappings(tmp_path) -> None:
     product.variants.append(variant)
     session.add(product)
     session.commit()
+    clients: list[FakeMedusaClient] = []
 
-    result = MedusaSyncService(session, client_factory=lambda config: FakeMedusaClient(config)).export_product(product.id, dry_run=False)
+    def factory(config):
+        client = FakeMedusaClient(config)
+        clients.append(client)
+        return client
+
+    result = MedusaSyncService(session, client_factory=factory).export_product(product.id, dry_run=False)
     assert result["status"] == "success"
     product_mapping = session.scalar(select(MedusaSyncMapping).where(MedusaSyncMapping.entity_type == "product"))
     variant_mapping = session.scalar(select(MedusaSyncMapping).where(MedusaSyncMapping.entity_type == "variant"))
     assert product_mapping.medusa_id == "prod_1"
     assert variant_mapping.medusa_id == "variant_1"
+    create_variant_payload = next(payload for action, payload in clients[0].writes if action == "create_variant")
+    assert create_variant_payload["prices"] == [
+        {
+            "currency_code": "chf",
+            "amount": 10,
+            "min_quantity": None,
+            "max_quantity": None,
+            "price_list_code": None,
+            "metadata": {"pim_variant_id": variant.id, "source": "pim-pam", "price_type": "sale"},
+        }
+    ]
+
+
+def test_export_skips_variant_without_price_with_clear_message(tmp_path) -> None:
+    session = _session(tmp_path)
+    config = get_or_create_medusa_connection(session)
+    config.api_token_secret = "token"
+    product = Product(sku="SKU-NOPRICE", handle="no-price", title="No Price Product", status="active", source_language="de-CH")
+    variant = ProductVariant(sku="SKU-NOPRICE", variant_title="Default", price=None, currency="CHF")
+    product.variants.append(variant)
+    session.add(product)
+    session.commit()
+    clients: list[FakeMedusaClient] = []
+
+    def factory(config):
+        client = FakeMedusaClient(config)
+        clients.append(client)
+        return client
+
+    result = MedusaSyncService(session, client_factory=factory).export_product(product.id, dry_run=False)
+
+    assert result["status"] == "partial_success"
+    variant_item = session.scalar(select(MedusaSyncRunItem).where(MedusaSyncRunItem.run_id == result["run_id"], MedusaSyncRunItem.entity_type == "variant"))
+    assert variant_item.status == "validation_error"
+    assert variant_item.error_message == f"Variante {variant.id} nicht exportiert: Verkaufspreis fehlt."
+    assert not any(action == "create_variant" for action, _payload in clients[0].writes)
 
 
 def test_missing_translation_route_falls_back_to_metadata(tmp_path) -> None:

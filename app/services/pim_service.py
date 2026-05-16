@@ -19,6 +19,7 @@ from app.db.models import (
     ChannelCategory,
     ChemicalDocument,
     ImportJob,
+    MedusaSyncMapping,
     Product,
     ProductCategoryAssignment,
     ProductCategoryMapping,
@@ -463,16 +464,21 @@ def get_products_for_channel_category(session: Session, category_id: int, includ
     category = session.get(ChannelCategory, int(category_id))
     if category is None:
         return []
-    stmt = (
-        select(Product)
+    product_ids = (
+        select(Product.id)
         .join(ProductCategoryMapping, ProductCategoryMapping.product_id == Product.id)
-        .options(joinedload(Product.brand), joinedload(Product.variants))
         .where(
             ProductCategoryMapping.channel_category_id == int(category_id),
             ProductCategoryMapping.sales_channel_id == category.sales_channel_id,
         )
-        .order_by(Product.title.asc(), Product.id.asc())
         .distinct()
+        .subquery()
+    )
+    stmt = (
+        select(Product)
+        .options(joinedload(Product.brand), joinedload(Product.variants))
+        .where(Product.id.in_(select(product_ids.c.id)))
+        .order_by(Product.title.asc(), Product.id.asc())
     )
     rows: list[dict] = []
     for product in session.scalars(stmt).unique():
@@ -1401,7 +1407,7 @@ def set_product_categories_for_channel(
     session.flush()
     if not normalized_category_ids:
         return
-    for category_id in normalized_category_ids:
+    for index, category_id in enumerate(normalized_category_ids):
         category = session.get(Category, int(category_id))
         if category is None:
             raise ValueError("Kategorie nicht gefunden")
@@ -1412,6 +1418,7 @@ def set_product_categories_for_channel(
                 product_id=product.id,
                 category_id=category.id,
                 sales_channel_id=target_channel_id,
+                sort_order=index,
             )
         )
     session.flush()
@@ -1961,6 +1968,9 @@ def get_product_detail(session: Session, product_id: int) -> dict | None:
     }
     default_category_assignment = get_product_category_assignment_for_channel(session, product.id, DEFAULT_CATEGORY_CHANNEL_CODE)
     category_assignments = list_product_category_assignments(session, product.id)
+    variant_ids = [variant.id for variant in product.variants if variant.id is not None]
+    medusa_mappings = _medusa_mappings_for_product(session, product.id, variant_ids)
+    product_medusa_mapping = medusa_mappings.get(("product", product.id), {})
     return {
         "id": product.id,
         "sku": product.sku,
@@ -1981,6 +1991,7 @@ def get_product_detail(session: Session, product_id: int) -> dict | None:
         "category_channel_code": default_category_assignment["sales_channel_code"],
         "category_channel_name": default_category_assignment["sales_channel_name"],
         "category_assignments": category_assignments,
+        **_serialize_medusa_mapping(product_medusa_mapping, prefix="medusa"),
         **chemical_fields,
         **_serialize_chemical_enrichment_fields(product),
         "chemical_enrichments": [
@@ -2005,6 +2016,7 @@ def get_product_detail(session: Session, product_id: int) -> dict | None:
                 "stock_qty": variant.stock_qty,
                 "barcode": variant.barcode,
                 "status": variant.status,
+                **_serialize_medusa_mapping(medusa_mappings.get(("variant", variant.id), {}), prefix="medusa"),
                 "price_tiers": [_serialize_price_tier(variant, tier) for tier in _sorted_price_tiers(variant)],
                 "channel_listings": [
                     _serialize_variant_channel_listing(listing, listing.sales_channel, variant)
@@ -2068,6 +2080,57 @@ def get_product_detail(session: Session, product_id: int) -> dict | None:
         "channel_category_mappings": list_product_category_mappings(session, product.id),
         "variant_channel_listings": list_variant_channel_listings(session, product.id),
         "variant_category_mappings": list_variant_category_mappings(session, product.id),
+    }
+
+
+def _medusa_mappings_for_product(session: Session, product_id: int, variant_ids: list[int]) -> dict[tuple[str, int], dict]:
+    ids_by_type: dict[str, list[int]] = {"product": [product_id]}
+    if variant_ids:
+        ids_by_type["variant"] = variant_ids
+    rows = []
+    for entity_type, local_ids in ids_by_type.items():
+        rows.extend(
+            session.scalars(
+                select(MedusaSyncMapping)
+                .where(
+                    MedusaSyncMapping.entity_type == entity_type,
+                    MedusaSyncMapping.local_entity_id.in_(local_ids),
+                )
+                .order_by(MedusaSyncMapping.connection_id.asc(), MedusaSyncMapping.id.desc())
+            ).all()
+        )
+    mappings: dict[tuple[str, int], dict] = {}
+    for row in rows:
+        key = (row.entity_type, row.local_entity_id)
+        if key in mappings and mappings[key].get("status") == "active":
+            continue
+        mappings[key] = {
+            "id": row.id,
+            "connection_id": row.connection_id,
+            "medusa_id": row.medusa_id,
+            "medusa_parent_id": row.medusa_parent_id,
+            "medusa_handle": row.medusa_handle,
+            "medusa_sku": row.medusa_sku,
+            "medusa_external_id": row.medusa_external_id,
+            "status": row.status,
+            "last_synced_at": row.last_synced_at.isoformat() if row.last_synced_at else None,
+            "last_seen_in_medusa_at": row.last_seen_in_medusa_at.isoformat() if row.last_seen_in_medusa_at else None,
+        }
+    return mappings
+
+
+def _serialize_medusa_mapping(mapping: dict, *, prefix: str) -> dict:
+    return {
+        f"{prefix}_mapping_id": mapping.get("id"),
+        f"{prefix}_connection_id": mapping.get("connection_id"),
+        f"{prefix}_id": mapping.get("medusa_id"),
+        f"{prefix}_parent_id": mapping.get("medusa_parent_id"),
+        f"{prefix}_handle": mapping.get("medusa_handle"),
+        f"{prefix}_sku": mapping.get("medusa_sku"),
+        f"{prefix}_external_id": mapping.get("medusa_external_id"),
+        f"{prefix}_mapping_status": mapping.get("status") or "not_mapped",
+        f"{prefix}_last_synced_at": mapping.get("last_synced_at"),
+        f"{prefix}_last_seen_in_medusa_at": mapping.get("last_seen_in_medusa_at"),
     }
 
 
@@ -2455,24 +2518,42 @@ def _category_descendant_ids(session: Session, category: Category) -> list[int]:
     return ids
 
 
+def _primary_image_asset(product: Product) -> Asset | None:
+    image_assets = [asset for asset in product.assets if (asset.mime_type or "").startswith("image/")]
+    return min(image_assets, key=lambda asset: (asset.sort_order, asset.id), default=None)
+
+
 def get_products_for_category(session: Session, category_id: int, include_variants: bool = False, include_descendants: bool = True) -> list[dict]:
     category = session.get(Category, int(category_id))
     if category is None:
         return []
     category_ids = _category_descendant_ids(session, category) if include_descendants else [int(category_id)]
-    stmt = (
-        select(Product)
-        .join(ProductCategoryAssignment, ProductCategoryAssignment.product_id == Product.id)
-        .options(joinedload(Product.brand), joinedload(Product.variants))
+    assignment_rows = session.execute(
+        select(
+            ProductCategoryAssignment.product_id,
+            func.min(ProductCategoryAssignment.sort_order).label("sort_order"),
+        )
+        .select_from(ProductCategoryAssignment)
+        .join(Product, Product.id == ProductCategoryAssignment.product_id)
         .where(
             ProductCategoryAssignment.category_id.in_(category_ids),
             ProductCategoryAssignment.sales_channel_id == category.sales_channel_id,
         )
-        .order_by(Product.title.asc(), Product.id.asc())
-        .distinct()
+        .group_by(ProductCategoryAssignment.product_id)
+        .order_by(func.min(ProductCategoryAssignment.sort_order).asc(), ProductCategoryAssignment.product_id.asc())
+    ).all()
+    product_order = {int(row.product_id): index for index, row in enumerate(assignment_rows)}
+    sort_orders = {int(row.product_id): int(row.sort_order or 0) for row in assignment_rows}
+    if not product_order:
+        return []
+    stmt = (
+        select(Product)
+        .options(joinedload(Product.brand), joinedload(Product.variants), joinedload(Product.assets))
+        .where(Product.id.in_(product_order.keys()))
     )
     rows: list[dict] = []
-    for product in session.scalars(stmt).unique():
+    for product in sorted(session.scalars(stmt).unique(), key=lambda item: product_order.get(int(item.id), 0)):
+        primary_asset = _primary_image_asset(product)
         variant_rows = [
             {
                 "id": variant.id,
@@ -2485,8 +2566,14 @@ def get_products_for_category(session: Session, category_id: int, include_varian
         rows.append(
             {
                 "id": product.id,
+                "sort_order": sort_orders.get(int(product.id), 0),
                 "sku": product.sku,
                 "title": product.title,
+                "photo_asset_id": primary_asset.id if primary_asset else None,
+                "photo_url": f"/asset-file/{primary_asset.id}" if primary_asset else None,
+                "photo_thumb_url": f"/asset-thumb/{primary_asset.id}" if primary_asset else None,
+                "photo_filename": primary_asset.filename if primary_asset else None,
+                "photo_mime_type": primary_asset.mime_type if primary_asset else None,
                 "brand": product.brand.name if product.brand else None,
                 "status": product.status,
                 "variant_count": len(product.variants),
@@ -2497,6 +2584,82 @@ def get_products_for_category(session: Session, category_id: int, include_varian
             }
         )
     return rows
+
+
+def move_products_to_category(
+    session: Session,
+    product_ids: Iterable[int],
+    target_category_id: int,
+    *,
+    source_category_id: int | None = None,
+    ordered_product_ids: Iterable[int] | None = None,
+) -> dict[str, object]:
+    target = session.get(Category, int(target_category_id))
+    if target is None:
+        raise ValueError("Ziel-Kategorie nicht gefunden")
+    same_category = source_category_id is not None and int(source_category_id) == int(target_category_id)
+
+    source_category_ids: list[int] = []
+    if source_category_id is not None:
+        source = session.get(Category, int(source_category_id))
+        if source is None:
+            raise ValueError("Quell-Kategorie nicht gefunden")
+        if int(source.sales_channel_id) != int(target.sales_channel_id):
+            raise ValueError("Quell- und Ziel-Kategorie gehören nicht zum selben Kanal")
+        source_category_ids = _category_descendant_ids(session, source)
+
+    moved = 0
+    skipped = 0
+    for product_id in _unique_ints(product_ids):
+        product = session.get(Product, int(product_id))
+        if product is None:
+            skipped += 1
+            continue
+        if source_category_ids and not same_category:
+            existing_source_rows = list(
+                session.scalars(
+                    select(ProductCategoryAssignment).where(
+                        ProductCategoryAssignment.product_id == product.id,
+                        ProductCategoryAssignment.sales_channel_id == target.sales_channel_id,
+                        ProductCategoryAssignment.category_id.in_(source_category_ids),
+                    )
+                )
+            )
+            for row in existing_source_rows:
+                session.delete(row)
+        existing_target = session.scalar(
+            select(ProductCategoryAssignment).where(
+                ProductCategoryAssignment.product_id == product.id,
+                ProductCategoryAssignment.sales_channel_id == target.sales_channel_id,
+                ProductCategoryAssignment.category_id == target.id,
+            )
+        )
+        if existing_target is None:
+            existing_target = ProductCategoryAssignment(
+                product_id=product.id,
+                category_id=target.id,
+                sales_channel_id=target.sales_channel_id,
+            )
+            session.add(existing_target)
+        moved += 1
+    ordered_ids = _unique_ints(ordered_product_ids or [])
+    if same_category and ordered_ids:
+        order_rows = list(
+            session.scalars(
+                select(ProductCategoryAssignment).where(
+                    ProductCategoryAssignment.category_id == target.id,
+                    ProductCategoryAssignment.sales_channel_id == target.sales_channel_id,
+                )
+            )
+        )
+        order_index = {product_id: index for index, product_id in enumerate(ordered_ids)}
+        next_order = len(order_index)
+        for row in sorted(order_rows, key=lambda item: order_index.get(int(item.product_id), next_order + int(item.id))):
+            row.sort_order = order_index.get(int(row.product_id), next_order)
+            if int(row.product_id) not in order_index:
+                next_order += 1
+    session.flush()
+    return {"moved": moved, "skipped": skipped, "target_category_id": target.id, "target_category_name": target.name}
 
 
 def create_category(
