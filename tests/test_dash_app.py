@@ -58,11 +58,15 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "channel-bulk-confirm" in layout_repr
     assert "channel-bulk-action" in layout_repr
     assert "channel-bulk-sales-channel-id" in layout_repr
+    assert "Vertriebskanäle" in layout_repr
     assert "channel-bulk-channel-category-id" in layout_repr
     assert "channel-bulk-category-status" in layout_repr
     assert "ProductCategoryDragCell" in layout_repr
     assert "CategoryDropTargetCell" in layout_repr
     assert "category-browser-layout" in layout_repr
+    assert "category-products-target-category-id" in layout_repr
+    assert "category-products-active-product-id" in layout_repr
+    assert "category-products-move-selected-button" in layout_repr
     assert "product-select-all-button" in layout_repr
     assert "product-select-filtered-button" in layout_repr
     assert "product-select-page-button" in layout_repr
@@ -235,6 +239,26 @@ def test_channel_bulk_category_dropdown_reports_empty_channel() -> None:
     assert value is None
     assert disabled is True
     assert "Keine Kanal-Kategorien für voxster.ch (voxster) gefunden" in message
+
+
+def test_channel_bulk_category_dropdown_disables_for_multiple_channels() -> None:
+    snapshot = {
+        "sales_channels": [
+            {"id": 1, "code": "voxster", "name": "voxster.ch"},
+            {"id": 2, "code": "pos", "name": "POS"},
+        ],
+        "channel_category_options": [
+            {"label": "voxster · Reiniger · 10", "value": 10, "sales_channel_id": 1},
+            {"label": "pos · Laden · 20", "value": 20, "sales_channel_id": 2},
+        ],
+    }
+
+    options, value, disabled, message = _channel_bulk_category_dropdown_state([1, 2], snapshot)
+
+    assert options == []
+    assert value is None
+    assert disabled is True
+    assert "genau einem Vertriebskanal" in message
 
 
 def test_channel_bulk_category_dropdown_handles_invalid_channel_id() -> None:

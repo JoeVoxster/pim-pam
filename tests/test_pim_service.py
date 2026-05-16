@@ -1595,7 +1595,49 @@ def test_move_products_to_same_category_updates_sort_order(tmp_path) -> None:
         products = get_products_for_category(session, category.id)
 
     assert [row["id"] for row in products] == [product_b.id, product_a.id]
-    assert [row["sort_order"] for row in products] == [0, 1]
+    assert [row["position"] for row in products] == [10, 20]
+
+
+def test_move_product_down_inside_same_category_reorders_with_ten_step_positions(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        ensure_default_sales_channels(session)
+        category = create_category(session, "Drag Category", None, "de", 1, sales_channel_code="voxster")
+        products = []
+        for index, position in enumerate([10, 20, 30, 40, 50, 60, 70, 80, 90], start=1):
+            product, _variant = create_product(
+                session,
+                ProductCreate(sku=f"DRAG-{index}", title=f"Drag Product {index}", status="ready"),
+                VariantCreate(sku=f"DRAG-{index}-A", variant_title="A"),
+            )
+            set_product_categories_for_channel(session, product, [category.id], "voxster")
+            products.append(product)
+        session.commit()
+        bulk_update_category_product_positions(
+            session,
+            category.id,
+            [{"product_id": product.id, "position": position} for product, position in zip(products, [10, 20, 30, 40, 50, 60, 70, 80, 90])],
+        )
+        session.commit()
+
+        ordered_ids = [product.id for product in products[:4]] + [product.id for product in products[5:8]] + [products[4].id, products[8].id]
+        move_products_to_category(
+            session,
+            [products[4].id],
+            category.id,
+            source_category_id=category.id,
+            ordered_product_ids=ordered_ids,
+        )
+        session.commit()
+        rows = get_products_for_category(session, category.id)
+
+    assert [row["id"] for row in rows] == ordered_ids
+    assert rows[7]["id"] == products[4].id
+    assert rows[7]["position"] == 80
+    assert [row["position"] for row in rows] == [10, 20, 30, 40, 50, 60, 70, 80, 90]
 
 
 def test_bulk_update_products_supports_preview_apply_and_backup(tmp_path) -> None:

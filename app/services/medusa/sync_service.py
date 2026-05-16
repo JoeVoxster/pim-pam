@@ -8,20 +8,29 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import (
+    Category,
+    ChannelCategory,
     MedusaConnectionConfig,
     MedusaSyncMapping,
     MedusaSyncRun,
     MedusaSyncRunItem,
     Product,
+    ProductCategoryAssignment,
     ProductCategoryMapping,
     ProductTranslation,
     ProductVariant,
     VariantTranslation,
 )
 from app.services.medusa.client import MedusaAdminApiClient, MedusaApiError, MedusaAuthError
+from app.services.medusa.category_position_service import (
+    POSITION_ENTITY_TYPE,
+    build_medusa_category_product_position_payload,
+    build_medusa_internal_category_product_position_payload,
+)
 from app.services.medusa.config_service import get_or_create_medusa_connection, mark_connection_test_result
 from app.services.medusa.mappers import (
     MedusaAssetMapper,
+    MedusaCategoryMapper,
     MedusaPricingMapper,
     MedusaProductMapper,
     MedusaTranslationMapper,
@@ -164,6 +173,8 @@ class MedusaSyncService:
         pricing_mapper = MedusaPricingMapper()
         default_translation = _translation_for(product, config.default_locale)
         product_payload = mapper.map_product(product, translation=default_translation, image_urls=asset_mapper.image_urls(product))
+        self._attach_product_categories(config, product, product_payload.payload)
+        product_payload = type(product_payload)(payload=product_payload.payload, hash=stable_hash(product_payload.payload), locale=product_payload.locale)
         product_mapping = self._mapping(config, "product", product.id)
         product_action = self._planned_action(product_mapping, product_payload.hash, force=force)
 
@@ -245,6 +256,268 @@ class MedusaSyncService:
             self._add_item(run, "mapping", None, "error", "error", error_message=str(exc))
             self._finish_run(run, "failed", {"error": str(exc)})
             return {"status": "failed", "run_id": run.id, "message": str(exc)}
+
+    def export_channel_categories(
+        self,
+        *,
+        sales_channel_id: int | None = None,
+        channel_category_ids: list[int] | None = None,
+        connection_name: str = "default",
+        dry_run: bool,
+        limit: int | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        config = get_or_create_medusa_connection(self.session, connection_name)
+        category_ids = _unique_ints(channel_category_ids)
+        if not category_ids:
+            category_ids = self.resolve_pim_category_ids(sales_channel_id=sales_channel_id, limit=limit)
+        if not category_ids:
+            return {"status": "failed", "message": "Keine Kanal-Kategorien für Medusa-Export ausgewählt.", "category_count": 0}
+        run = self._start_run(
+            config,
+            "category_dry_run" if dry_run else "category_export",
+            {"channel_category_ids": category_ids, "sales_channel_id": sales_channel_id, "force": force},
+        )
+        client = self.client_factory(config)
+        mapper = MedusaCategoryMapper()
+        for category_id in self._sort_pim_category_ids_for_export(category_ids):
+            category = self.session.get(Category, category_id)
+            if category is None:
+                self._add_item(run, "category", category_id, "error", "validation_error", error_message="Kategorie nicht gefunden.")
+                continue
+            mapping = self._mapping(config, "category", category.id)
+            parent_mapping = self._parent_pim_category_mapping(config, category)
+            category_payload = mapper.map_category(
+                category,
+                medusa_id=mapping.medusa_id if mapping else None,
+                parent_category_id=parent_mapping.medusa_id if parent_mapping else None,
+            )
+            action = self._planned_action(mapping, category_payload.hash, force=force)
+            if dry_run:
+                self._add_item(run, "category", category.id, f"would_{action}", "planned", medusa_id=mapping.medusa_id if mapping else None, request_payload=category_payload.payload, diff={"hash": category_payload.hash})
+                continue
+            try:
+                response = client.create_or_update_category(dict(category_payload.payload))
+                medusa_category = response.get("product_category", response.get("category", response)) if isinstance(response, dict) else {}
+                medusa_id = str(medusa_category.get("id") or category_payload.payload.get("id") or "")
+                if not medusa_id:
+                    raise MedusaApiError("Medusa-Antwort enthält keine Product Category ID.", response_payload=response)
+                mapping = self._get_or_create_mapping(config, "category", category.id)
+                mapping.medusa_id = medusa_id
+                mapping.medusa_handle = category_payload.handle
+                mapping.medusa_external_id = category.slug
+                mapping.local_hash = category_payload.hash
+                mapping.last_synced_at = datetime.now(timezone.utc)
+                mapping.status = "active"
+                self._add_item(run, "category", category.id, action, "success", medusa_id=medusa_id, request_payload=category_payload.payload, response_payload=response)
+            except Exception as exc:
+                self._add_item(run, "category", category.id, "error", "error", request_payload=category_payload.payload, error_message=str(exc))
+        status = "success" if not any(item.status in {"error", "validation_error"} for item in run.items) else "partial_success"
+        if all(item.status in {"error", "validation_error"} for item in run.items):
+            status = "failed"
+        self._finish_run(run, status, self._summary(run))
+        return {"status": status, "run_id": run.id, "category_count": len(category_ids), "summary": run.summary}
+
+    def resolve_channel_category_ids(
+        self,
+        *,
+        channel_category_id: int | None = None,
+        sales_channel_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[int]:
+        max_items = max(1, int(limit or 200))
+        if channel_category_id:
+            return [int(channel_category_id)]
+        stmt = select(ChannelCategory.id).where(ChannelCategory.is_active.is_(True)).order_by(ChannelCategory.id.asc()).limit(max_items)
+        if sales_channel_id:
+            stmt = stmt.where(ChannelCategory.sales_channel_id == int(sales_channel_id))
+        return list(self.session.scalars(stmt))
+
+    def resolve_pim_category_ids(
+        self,
+        *,
+        category_id: int | None = None,
+        sales_channel_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[int]:
+        max_items = max(1, int(limit or 200))
+        if category_id:
+            return [int(category_id)]
+        stmt = select(Category.id).order_by(Category.sort_order.asc(), Category.name.asc(), Category.id.asc()).limit(max_items)
+        if sales_channel_id:
+            stmt = stmt.where(Category.sales_channel_id == int(sales_channel_id))
+        return list(self.session.scalars(stmt))
+
+    def _sort_channel_category_ids_for_export(self, category_ids: list[int]) -> list[int]:
+        rows = list(self.session.scalars(select(ChannelCategory).where(ChannelCategory.id.in_(category_ids))).unique())
+        rows.sort(key=lambda row: (_path_depth(row.external_path), row.external_path or "", row.name or "", row.id))
+        return [row.id for row in rows]
+
+    def _sort_pim_category_ids_for_export(self, category_ids: list[int]) -> list[int]:
+        rows = list(self.session.scalars(select(Category).where(Category.id.in_(category_ids))).unique())
+        by_id = {row.id: row for row in rows}
+        depth_cache: dict[int, int] = {}
+
+        def depth(row: Category) -> int:
+            if row.id in depth_cache:
+                return depth_cache[row.id]
+            parent = by_id.get(row.parent_id) if row.parent_id else None
+            value = 1 + depth(parent) if parent else 0
+            depth_cache[row.id] = value
+            return value
+
+        rows.sort(key=lambda row: (depth(row), row.sort_order, row.name or "", row.id))
+        return [row.id for row in rows]
+
+    def _parent_category_mapping(self, config: MedusaConnectionConfig, category: ChannelCategory) -> MedusaSyncMapping | None:
+        parent_path = _parent_path(category.external_path)
+        if not parent_path:
+            return None
+        parent = self.session.scalar(
+            select(ChannelCategory).where(
+                ChannelCategory.sales_channel_id == category.sales_channel_id,
+                ChannelCategory.external_path == parent_path,
+            )
+        )
+        if parent is None:
+            return None
+        return self._mapping(config, "channel_category", parent.id)
+
+    def _parent_pim_category_mapping(self, config: MedusaConnectionConfig, category: Category) -> MedusaSyncMapping | None:
+        if not category.parent_id:
+            return None
+        return self._mapping(config, "category", category.parent_id)
+
+    def _attach_product_categories(self, config: MedusaConnectionConfig, product: Product, payload: dict[str, Any]) -> None:
+        categories: list[dict[str, str]] = []
+        metadata_categories: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for mapping in sorted(product.channel_category_mappings or [], key=lambda row: (row.sales_channel_id, row.position, row.channel_category_id)):
+            category_mapping = self._mapping(config, "channel_category", mapping.channel_category_id)
+            medusa_id = category_mapping.medusa_id if category_mapping else None
+            if medusa_id and medusa_id not in seen:
+                categories.append({"id": medusa_id})
+                seen.add(medusa_id)
+            metadata_categories.append(
+                {
+                    "pimpam_category_id": str(mapping.channel_category_id),
+                    "medusa_category_id": medusa_id,
+                    "sales_channel_id": mapping.sales_channel_id,
+                    "position": mapping.position if mapping.position is not None else 9999,
+                }
+            )
+        if categories:
+            payload["categories"] = categories
+        if metadata_categories:
+            metadata = dict(payload.get("metadata") or {})
+            metadata["pim_category_mappings"] = metadata_categories
+            payload["metadata"] = metadata
+        internal_categories: list[dict[str, Any]] = []
+        for assignment in sorted(product.category_links or [], key=lambda row: (row.sales_channel_id, row.sort_order, row.category_id)):
+            category_mapping = self._mapping(config, "category", assignment.category_id)
+            medusa_id = category_mapping.medusa_id if category_mapping else None
+            if medusa_id and medusa_id not in seen:
+                categories.append({"id": medusa_id})
+                seen.add(medusa_id)
+            internal_categories.append(
+                {
+                    "pimpam_category_id": str(assignment.category_id),
+                    "medusa_category_id": medusa_id,
+                    "sales_channel_id": assignment.sales_channel_id,
+                    "position": assignment.sort_order if assignment.sort_order is not None else 9999,
+                }
+            )
+        if categories:
+            payload["categories"] = categories
+        if internal_categories:
+            metadata = dict(payload.get("metadata") or {})
+            metadata["pim_category_mappings"] = internal_categories
+            payload["metadata"] = metadata
+
+    def sync_category_product_positions(
+        self,
+        *,
+        channel_category_ids: list[int],
+        connection_name: str = "default",
+        dry_run: bool,
+        use_sales_channel: bool = True,
+    ) -> dict[str, Any]:
+        ids = _unique_ints(channel_category_ids)
+        if not ids:
+            return {"status": "failed", "message": "Keine Kanal-Kategorien für Positionssync ausgewählt.", "category_count": 0}
+        config = get_or_create_medusa_connection(self.session, connection_name)
+        run = self._start_run(
+            config,
+            "category_position_dry_run" if dry_run else "category_position_sync",
+            {"channel_category_ids": ids, "use_sales_channel": use_sales_channel},
+        )
+        client = self.client_factory(config)
+        for category_id in ids:
+            try:
+                if self.session.get(Category, category_id) is not None:
+                    payload = build_medusa_internal_category_product_position_payload(
+                        self.session,
+                        config,
+                        category_id=category_id,
+                        use_sales_channel=use_sales_channel,
+                    )
+                else:
+                    payload = build_medusa_category_product_position_payload(
+                        self.session,
+                        config,
+                        channel_category_id=category_id,
+                        use_sales_channel=use_sales_channel,
+                    )
+                if dry_run:
+                    self._add_item(
+                        run,
+                        POSITION_ENTITY_TYPE,
+                        category_id,
+                        "would_sync_positions",
+                        "planned",
+                        medusa_id=payload.get("product_category_id"),
+                        request_payload=payload,
+                        diff={"items": len(payload.get("items") or [])},
+                    )
+                else:
+                    response = client.sync_category_product_positions(payload)
+                    status = "success" if bool(response.get("success", True)) else "error"
+                    self._add_item(
+                        run,
+                        POSITION_ENTITY_TYPE,
+                        category_id,
+                        "sync_positions",
+                        status,
+                        medusa_id=payload.get("product_category_id"),
+                        request_payload=payload,
+                        response_payload=response,
+                        diff={
+                            "items": len(payload.get("items") or []),
+                            "created": response.get("created"),
+                            "updated": response.get("updated"),
+                            "skipped": response.get("skipped"),
+                        },
+                        error_message="; ".join(map(str, response.get("errors") or [])) or None,
+                    )
+            except Exception as exc:
+                self._add_item(
+                    run,
+                    POSITION_ENTITY_TYPE,
+                    category_id,
+                    "validate_positions" if dry_run else "sync_positions",
+                    "validation_error",
+                    error_message=str(exc),
+                )
+        status = "success" if not any(item.status in {"error", "validation_error"} for item in run.items) else "partial_success"
+        if not dry_run and all(item.status in {"error", "validation_error"} for item in run.items):
+            status = "failed"
+        self._finish_run(run, status, self._summary(run))
+        return {
+            "status": status,
+            "run_id": run.id,
+            "category_count": len(ids),
+            "summary": run.summary,
+        }
 
     def _upsert_product(
         self,
@@ -680,6 +953,17 @@ def _unique_ints(values: list[int] | None) -> list[int]:
             seen.add(item)
             output.append(item)
     return output
+
+
+def _path_depth(value: str | None) -> int:
+    return len([part for part in str(value or "").split(">") if part.strip()])
+
+
+def _parent_path(value: str | None) -> str | None:
+    parts = [part.strip() for part in str(value or "").split(">") if part.strip()]
+    if len(parts) <= 1:
+        return None
+    return " > ".join(parts[:-1])
 
 
 def _medusa_variant_prices_payload(prices: list[dict[str, Any]]) -> dict[str, Any]:

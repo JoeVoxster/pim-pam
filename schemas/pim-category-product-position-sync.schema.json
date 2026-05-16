@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxster.ch/schemas/pim-category-product-position-sync.json",
+  "title": "PimPam Category Product Position Sync",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "sales_channel_id": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "sales_channel_handle": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "product_category_id": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "category_handle": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "source": {
+      "type": ["string", "null"],
+      "default": "pim_pam"
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "product_id": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "product_handle": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "position": {
+            "type": ["integer", "number", "string", "null"]
+          }
+        },
+        "anyOf": [
+          { "required": ["product_id"] },
+          { "required": ["product_handle"] }
+        ],
+        "required": ["position"]
+      }
+    }
+  },
+  "anyOf": [
+    { "required": ["product_category_id"] },
+    { "required": ["category_handle"] }
+  ],
+  "required": ["items"]
+}

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from app.db.models import Asset, MedusaConnectionConfig, Product, ProductTranslation, ProductVariant, ProductVariantPriceTier, VariantTranslation
+from app.db.models import Asset, Category, ChannelCategory, MedusaConnectionConfig, Product, ProductTranslation, ProductVariant, ProductVariantPriceTier, VariantTranslation
 
 
 def stable_hash(payload: Any) -> str:
@@ -37,6 +37,58 @@ class VariantPayload:
     payload: dict[str, Any]
     hash: str
     sku: str | None
+
+
+@dataclass(frozen=True)
+class CategoryPayload:
+    local_id: int
+    payload: dict[str, Any]
+    hash: str
+    handle: str
+
+
+class MedusaCategoryMapper:
+    def map_category(self, category: Category, *, medusa_id: str | None = None, parent_category_id: str | None = None) -> CategoryPayload:
+        handle = normalize_handle(category.slug or category.name)
+        payload: dict[str, Any] = {
+            "id": medusa_id,
+            "name": _text(category.name),
+            "handle": handle,
+            "is_active": True,
+            "parent_category_id": parent_category_id,
+            "metadata": {
+                "source": "pim_pam",
+                "pimpam_category_id": category.id,
+                "pimpam_sales_channel_id": category.sales_channel_id,
+                "sales_channel": category.sales_channel.name if category.sales_channel else None,
+                "sales_channel_code": category.sales_channel.code if category.sales_channel else None,
+                "language_code": category.language_code,
+                "sort_order": category.sort_order,
+            },
+        }
+        clean_payload = _prune(payload)
+        return CategoryPayload(local_id=category.id, payload=clean_payload, hash=stable_hash(clean_payload), handle=handle)
+
+    def map_channel_category(self, category: ChannelCategory, *, medusa_id: str | None = None, parent_category_id: str | None = None) -> CategoryPayload:
+        handle = normalize_handle(category.external_category_id or category.name)
+        payload: dict[str, Any] = {
+            "id": medusa_id,
+            "name": _text(category.name),
+            "handle": handle,
+            "is_active": bool(category.is_active),
+            "parent_category_id": parent_category_id,
+            "metadata": {
+                "source": "pim_pam",
+                "pimpam_channel_category_id": category.id,
+                "pimpam_sales_channel_id": category.sales_channel_id,
+                "sales_channel": category.sales_channel.name if category.sales_channel else None,
+                "sales_channel_code": category.sales_channel.code if category.sales_channel else None,
+                "external_category_id": category.external_category_id,
+                "external_path": category.external_path,
+            },
+        }
+        clean_payload = _prune(payload)
+        return CategoryPayload(local_id=category.id, payload=clean_payload, hash=stable_hash(clean_payload), handle=handle)
 
 
 class MedusaProductMapper:

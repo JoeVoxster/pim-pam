@@ -1182,14 +1182,17 @@ def _channel_bulk_actions_style(has_selection: bool) -> dict:
     return {"display": "block"} if has_selection else {"display": "none"}
 
 
-def _channel_bulk_category_dropdown_state(sales_channel_id: int | str | None, snapshot: dict | None) -> tuple[list[dict], None, bool, str]:
+def _channel_bulk_category_dropdown_state(sales_channel_id: int | str | list | None, snapshot: dict | None) -> tuple[list[dict], None, bool, str]:
     snapshot = snapshot or {}
     options = snapshot.get("channel_category_options", []) or []
     channels = snapshot.get("sales_channels", []) or []
+    channel_ids = _selected_channel_ids(sales_channel_id)
+    if len(channel_ids) > 1:
+        return [], None, True, "Kanal-Kategorie kann nur bei genau einem Vertriebskanal ausgewählt werden."
     if not sales_channel_id:
         return [], None, True, "Bitte zuerst Vertriebskanal auswählen."
     try:
-        channel_id = int(sales_channel_id)
+        channel_id = int(channel_ids[0] if channel_ids else sales_channel_id)
     except (TypeError, ValueError):
         return [], None, True, "Fehler beim Laden der Kanal-Kategorien: ungültige Vertriebskanal-ID."
 
@@ -1210,6 +1213,39 @@ def _channel_bulk_category_dropdown_state(sales_channel_id: int | str | None, sn
     if not filtered:
         return [], None, True, f"Keine Kanal-Kategorien für {channel_label} gefunden."
     return filtered, None, False, f"Vertriebskanal {channel_label} geladen. {len(filtered)} Kanal-Kategorien verfügbar."
+
+
+def _selected_channel_ids(value: int | str | list | None) -> list[int]:
+    values = value if isinstance(value, list) else ([value] if value not in (None, "") else [])
+    output: list[int] = []
+    for item in values:
+        try:
+            channel_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if channel_id not in output:
+            output.append(channel_id)
+    return output
+
+
+def _filter_channel_category_options_by_channel(options: list[dict], sales_channel_id: int | str | None) -> list[dict]:
+    if not sales_channel_id:
+        return options
+    try:
+        channel_id = int(sales_channel_id)
+    except (TypeError, ValueError):
+        return []
+    return [item for item in options if int(item.get("sales_channel_id") or 0) == channel_id]
+
+
+def _filter_category_options_by_sales_channel_id(options: list[dict], sales_channel_id: int | str | None) -> list[dict]:
+    if not sales_channel_id:
+        return options
+    try:
+        channel_id = int(sales_channel_id)
+    except (TypeError, ValueError):
+        return []
+    return [item for item in options if int(item.get("sales_channel_id") or 0) == channel_id]
 
 
 def _product_bulk_updates(fields: list[str] | None, source_language: str | None, brand_name: str | None, status: str | None, is_chemical: bool | None) -> dict[str, object]:
@@ -2889,7 +2925,7 @@ def create_dash_app() -> Dash:
     @app.server.get("/api/products/<int:product_id>/translations")
     def api_product_translations(product_id: int):
         with session_scope(get_pim_settings().database_url) as session:
-            detail = get_product_detail(session, product_id)
+            detail = get_product_detail(session, product_id, include_sdb=False)
             if detail is None:
                 abort(404)
             return jsonify(detail.get("translations", []))
@@ -2897,7 +2933,7 @@ def create_dash_app() -> Dash:
     @app.server.get("/api/products/<int:product_id>/sdb-documents")
     def api_product_sdb_documents(product_id: int):
         with session_scope(get_pim_settings().database_url) as session:
-            if get_product_detail(session, product_id) is None:
+            if get_product_detail(session, product_id, include_sdb=False) is None:
                 abort(404)
             return jsonify(list_sdb_documents_for_product(session, product_id))
 
@@ -2973,10 +3009,10 @@ def create_dash_app() -> Dash:
     @app.server.get("/chemical-sdb-pdf/<int:product_id>")
     def serve_chemical_sdb_pdf(product_id: int):
         with session_scope(get_pim_settings().database_url) as session:
-            detail = get_product_detail(session, product_id)
+            detail = get_product_detail(session, product_id, include_sdb=False)
             if detail is None:
                 abort(404)
-            sdb_data = detail.get("sdb") or {}
+            sdb_data = get_product_sdb(session, product_id)
             pdf_path = sdb_data.get("generated_pdf_path")
             if not pdf_path:
                 abort(404)
@@ -3076,7 +3112,7 @@ def create_dash_app() -> Dash:
                             html.Div(
                                 [
                                     html.Div([html.Label("Aktion"), dcc.Dropdown(id="channel-bulk-action", clearable=False)]),
-                                    html.Div([html.Label("Vertriebskanal"), dcc.Dropdown(id="channel-bulk-sales-channel-id", clearable=False)]),
+                                    html.Div([html.Label("Vertriebskanäle"), dcc.Dropdown(id="channel-bulk-sales-channel-id", multi=True, placeholder="Einen oder mehrere Kanäle auswählen")]),
                                     html.Div(
                                         [
                                             html.Label("Kanal-Kategorie"),
@@ -3992,6 +4028,7 @@ def create_dash_app() -> Dash:
                                                 [
                                                     html.Label("Kanal für Produkt-Kategorien"),
                                                     dcc.Dropdown(id="product-category-channel-code", value="voxster", clearable=False),
+                                                    html.Div(id="product-category-channel-status", className="selection-summary", style={"marginTop": "6px", "fontSize": "12px"}),
                                                 ]
                                             ),
                                             html.Div(
@@ -5297,6 +5334,15 @@ def create_dash_app() -> Dash:
                                                         ],
                                                         className="button-row",
                                                     ),
+                                                    html.Div(
+                                                        [
+                                                            dcc.Input(id="category-products-active-product-id", type="number", placeholder="Produkt-ID, z. B. 918"),
+                                                            dcc.Dropdown(id="category-products-target-category-id", placeholder="Ziel-Kategorie auswählen"),
+                                                            html.Button("Produkt-ID / Auswahl in Ziel-Kategorie verschieben", id="category-products-move-selected-button"),
+                                                        ],
+                                                        className="form-grid",
+                                                        style={"gridTemplateColumns": "180px minmax(260px, 1fr) auto", "alignItems": "end"},
+                                                    ),
                                                     html.Div(id="category-products-status", className="selection-summary"),
                                                     html.Div(id="category-breadcrumb", className="category-tree-description"),
                                                     grid(
@@ -6330,6 +6376,53 @@ def create_dash_app() -> Dash:
                                                         ],
                                                         className="button-row",
                                                     ),
+                                                    html.H4("Kanal-Kategorien"),
+                                                    html.Div(
+                                                        [
+                                                            html.Div([html.Label("Vertriebskanal"), dcc.Dropdown(id="medusa-category-sales-channel-id", options=[], clearable=True)]),
+                                                            html.Div([html.Label("Kanal-Kategorie"), dcc.Dropdown(id="medusa-category-channel-category-id", options=[], placeholder="leer = alle im Kanal", clearable=True)]),
+                                                            html.Div([html.Label("Max Kategorien"), dcc.Input(id="medusa-category-limit", type="number", value=200, min=1)]),
+                                                        ],
+                                                        className="form-grid",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Button("Kategorien Dry-Run", id="medusa-category-dry-run-button"),
+                                                            html.Button("Kanal-Kategorien nach Medusa exportieren", id="medusa-category-export-button"),
+                                                        ],
+                                                        className="button-row",
+                                                    ),
+                                                    html.H4("Kategorie-Produkt-Positionen"),
+                                                    html.Div(
+                                                        [
+                                                            html.Div(
+                                                                [
+                                                                    html.Label("Umfang"),
+                                                                    dcc.Dropdown(
+                                                                        id="medusa-position-sync-scope",
+                                                                        options=[
+                                                                            {"label": "Aktuelle Kanal-Kategorie-ID", "value": "single_category"},
+                                                                            {"label": "Alle Kategorien im Vertriebskanal", "value": "sales_channel"},
+                                                                        ],
+                                                                        value="single_category",
+                                                                        clearable=False,
+                                                                    ),
+                                                                ]
+                                                            ),
+                                                            html.Div([html.Label("Kanal-Kategorie"), dcc.Dropdown(id="medusa-position-channel-category-id", options=[], placeholder="Kategorie auswählen", clearable=True)]),
+                                                            html.Div([html.Label("Vertriebskanal"), dcc.Dropdown(id="medusa-position-sales-channel-id", options=[], clearable=True)]),
+                                                            html.Div([html.Label("Max Kategorien"), dcc.Input(id="medusa-position-limit", type="number", value=200, min=1)]),
+                                                            html.Div([html.Label("Sales Channel mitschicken"), dcc.Dropdown(id="medusa-position-use-sales-channel", options=BOOLEAN_OPTIONS, value=True, clearable=False)]),
+                                                        ],
+                                                        className="form-grid",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Button("Positionssync Dry-Run", id="medusa-position-dry-run-button"),
+                                                            html.Button("Medusa Kategorie-Produkt-Positionen synchronisieren", id="medusa-position-sync-button"),
+                                                        ],
+                                                        className="button-row",
+                                                    ),
                                                     html.Div(id="medusa-sync-status", className="selection-summary"),
                                                 ],
                                             ),
@@ -6447,6 +6540,10 @@ def register_callbacks(app: Dash) -> None:
         Output("medusa-dry-run-button", "disabled"),
         Output("medusa-export-button", "disabled"),
         Output("medusa-repair-button", "disabled"),
+        Output("medusa-category-dry-run-button", "disabled"),
+        Output("medusa-category-export-button", "disabled"),
+        Output("medusa-position-dry-run-button", "disabled"),
+        Output("medusa-position-sync-button", "disabled"),
         Output("open-product-enrich-modal-button", "disabled"),
         Output("product-enrich-run-button", "disabled"),
         Output("product-enrich-run-button", "children"),
@@ -6471,7 +6568,7 @@ def register_callbacks(app: Dash) -> None:
         else:
             button_label = "Website-Crawler für Produkte starten"
             running_hint = ""
-        return (running,) * 15 + (button_label, running_hint)
+        return (running,) * 19 + (button_label, running_hint)
 
     @app.callback(
         Output("product-data-enrichment-modal", "style"),
@@ -6831,11 +6928,23 @@ def register_callbacks(app: Dash) -> None:
         Input("medusa-dry-run-button", "n_clicks"),
         Input("medusa-export-button", "n_clicks"),
         Input("medusa-repair-button", "n_clicks"),
+        Input("medusa-category-dry-run-button", "n_clicks"),
+        Input("medusa-category-export-button", "n_clicks"),
+        Input("medusa-position-dry-run-button", "n_clicks"),
+        Input("medusa-position-sync-button", "n_clicks"),
         State("medusa-product-selection-mode", "value"),
         State("medusa-product-id", "value"),
         State("selected-product-ids", "data"),
         State("medusa-product-limit", "value"),
         State("medusa-force-update", "value"),
+        State("medusa-category-sales-channel-id", "value"),
+        State("medusa-category-channel-category-id", "value"),
+        State("medusa-category-limit", "value"),
+        State("medusa-position-sync-scope", "value"),
+        State("medusa-position-channel-category-id", "value"),
+        State("medusa-position-sales-channel-id", "value"),
+        State("medusa-position-limit", "value"),
+        State("medusa-position-use-sales-channel", "value"),
         prevent_initial_call=True,
     )
     @_with_session
@@ -6844,16 +6953,55 @@ def register_callbacks(app: Dash) -> None:
         _dry_clicks: int | None,
         _export_clicks: int | None,
         _repair_clicks: int | None,
+        _category_dry_clicks: int | None,
+        _category_export_clicks: int | None,
+        _position_dry_clicks: int | None,
+        _position_sync_clicks: int | None,
         selection_mode: str | None,
         product_id: int | None,
         selected_product_ids: list[int] | None,
         product_limit: int | None,
         force_update: bool | None,
+        category_sales_channel_id: int | None,
+        category_channel_category_id: int | None,
+        category_limit: int | None,
+        position_scope: str | None,
+        position_channel_category_id: int | None,
+        position_sales_channel_id: int | None,
+        position_limit: int | None,
+        position_use_sales_channel: bool | None,
     ):
         service = MedusaSyncService(session)
         try:
             if ctx.triggered_id == "medusa-repair-button":
                 result = service.repair_mapping()
+            elif ctx.triggered_id in {"medusa-category-dry-run-button", "medusa-category-export-button"}:
+                category_ids = [int(category_channel_category_id)] if category_channel_category_id else []
+                result = service.export_channel_categories(
+                    sales_channel_id=category_sales_channel_id,
+                    channel_category_ids=category_ids,
+                    dry_run=ctx.triggered_id == "medusa-category-dry-run-button",
+                    limit=category_limit,
+                    force=bool(force_update),
+                )
+            elif ctx.triggered_id in {"medusa-position-dry-run-button", "medusa-position-sync-button"}:
+                if position_scope == "sales_channel":
+                    category_ids = service.resolve_channel_category_ids(
+                        sales_channel_id=position_sales_channel_id,
+                        limit=position_limit,
+                    )
+                else:
+                    category_ids = service.resolve_channel_category_ids(
+                        channel_category_id=position_channel_category_id,
+                        limit=position_limit,
+                    )
+                if not category_ids:
+                    raise ValueError("Keine Kanal-Kategorien für Positionssync ausgewählt.")
+                result = service.sync_category_product_positions(
+                    channel_category_ids=category_ids,
+                    dry_run=ctx.triggered_id == "medusa-position-dry-run-button",
+                    use_sales_channel=bool(position_use_sales_channel),
+                )
             elif ctx.triggered_id == "medusa-export-button":
                 product_ids = service.resolve_product_ids(
                     selection_mode=selection_mode or "single",
@@ -6874,8 +7022,9 @@ def register_callbacks(app: Dash) -> None:
                 if not product_ids:
                     raise ValueError("Keine Produkte für Medusa-Dry-Run ausgewählt.")
                 result = service.export_products(product_ids, dry_run=True, force=bool(force_update))
-            count = result.get("product_count") or (1 if result.get("run_id") else 0)
-            message = f"Medusa {ctx.triggered_id}: {result.get('status')} · {count} Produkt(e)"
+            count = result.get("product_count") or result.get("category_count") or (1 if result.get("run_id") else 0)
+            unit = "Kategorie(n)" if any(token in str(ctx.triggered_id or "") for token in ["position", "category"]) else "Produkt(e)"
+            message = f"Medusa {ctx.triggered_id}: {result.get('status')} · {count} {unit}"
             run_ids = result.get("run_ids") or ([result.get("run_id")] if result.get("run_id") else [])
             latest_run_id = int(run_ids[-1]) if run_ids else None
             return message, html.Pre(json.dumps(result, ensure_ascii=False, indent=2, default=str)), list_medusa_runs(session), list_medusa_run_items(session, latest_run_id)
@@ -8214,7 +8363,7 @@ def register_callbacks(app: Dash) -> None:
         refresh_token: int,
         payload: dict | None,
         action: str | None,
-        sales_channel_id: int | None,
+        sales_channel_id: int | list | None,
         channel_category_id: int | None,
         allowed: bool | None,
         is_active: bool | None,
@@ -8225,39 +8374,45 @@ def register_callbacks(app: Dash) -> None:
         payload = payload or {}
         product_ids = payload.get("product_ids") or []
         variant_ids = payload.get("variant_ids") or []
-        if not action or not sales_channel_id:
+        sales_channel_ids = _selected_channel_ids(sales_channel_id)
+        if not action or not sales_channel_ids:
             return "Aktion und Vertriebskanal sind Pflicht.", no_update, no_update
+        if action in {"product_category_mappings", "assign_channel_category"} and len(sales_channel_ids) != 1:
+            return "Kanal-Kategorie-Zuweisung ist nur für genau einen Vertriebskanal möglich.", no_update, no_update
         try:
             product_count = 0
             variant_count = 0
             if action in {"product_listings", "assign_sales_channel"} and product_ids:
-                product_count = bulk_upsert_product_channel_listings(
-                    session,
-                    product_ids,
-                    int(sales_channel_id),
-                    allowed=bool(allowed),
-                    is_active=bool(is_active),
-                    publication_status=publication_status or "published",
-                    active_from=active_from,
-                    active_until=active_until,
-                )
+                for channel_id in sales_channel_ids:
+                    product_count += bulk_upsert_product_channel_listings(
+                        session,
+                        product_ids,
+                        int(channel_id),
+                        allowed=bool(allowed),
+                        is_active=bool(is_active),
+                        publication_status=publication_status or "published",
+                        active_from=active_from,
+                        active_until=active_until,
+                    )
             if action in {"variant_listings", "assign_sales_channel"} and variant_ids:
-                variant_count = bulk_upsert_variant_channel_listings(
-                    session,
-                    variant_ids,
-                    int(sales_channel_id),
-                    allowed=bool(allowed),
-                    is_active=bool(is_active),
-                    publication_status=publication_status or "published",
-                )
+                for channel_id in sales_channel_ids:
+                    variant_count += bulk_upsert_variant_channel_listings(
+                        session,
+                        variant_ids,
+                        int(channel_id),
+                        allowed=bool(allowed),
+                        is_active=bool(is_active),
+                        publication_status=publication_status or "published",
+                    )
             if action in {"product_category_mappings", "assign_channel_category"}:
                 if not channel_category_id:
                     return "Kanal-Kategorie ist für diese Aktion Pflicht.", no_update, no_update
+                channel_id = sales_channel_ids[0]
                 if payload.get("context") == "variants":
                     variant_count = bulk_upsert_variant_category_mappings(
                         session,
                         variant_ids,
-                        int(sales_channel_id),
+                        int(channel_id),
                         int(channel_category_id),
                         is_primary=True,
                     )
@@ -8265,14 +8420,14 @@ def register_callbacks(app: Dash) -> None:
                     product_count = bulk_upsert_product_category_mappings(
                         session,
                         product_ids,
-                        int(sales_channel_id),
+                        int(channel_id),
                         int(channel_category_id),
                         is_primary=True,
                     )
         except ValueError as exc:
             return str(exc), no_update, no_update
         return (
-            f"Kanal-Aktion ausgeführt: {product_count} Produkte, {variant_count} Varianten.",
+            f"Kanal-Aktion ausgeführt: {product_count} Produkt-Kanal-Zuordnungen, {variant_count} Varianten-Kanal-Zuordnungen über {len(sales_channel_ids)} Vertriebskanal/-kanäle.",
             (refresh_token or 0) + 1,
             PRODUCT_ENRICH_MODAL_HIDDEN,
         )
@@ -8571,6 +8726,8 @@ def register_callbacks(app: Dash) -> None:
         Output("sales-channel-form-id", "options"),
         Output("channel-category-form-sales-channel-id", "options"),
         Output("product-channel-mapping-sales-channel-id", "options"),
+        Output("medusa-category-sales-channel-id", "options"),
+        Output("medusa-position-sales-channel-id", "options"),
         Input("snapshot-store", "data"),
     )
     def apply_snapshot(snapshot: dict | None):
@@ -8598,6 +8755,8 @@ def register_callbacks(app: Dash) -> None:
             snapshot.get("sales_channel_code_options", []),
             snapshot.get("sales_channel_code_options", []),
             snapshot.get("sales_channel_code_options", []),
+            snapshot.get("sales_channel_options", []),
+            snapshot.get("sales_channel_options", []),
             snapshot.get("sales_channel_options", []),
             snapshot.get("sales_channel_options", []),
             snapshot.get("sales_channel_options", []),
@@ -8845,6 +9004,72 @@ def register_callbacks(app: Dash) -> None:
         return options, values
 
     @app.callback(
+        Output("product-category-channel-code", "options", allow_duplicate=True),
+        Output("product-category-channel-status", "children"),
+        Input("product-id", "value"),
+        Input("snapshot-store", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def load_product_category_channel_options(session: Session, product_id: int | None, snapshot: dict | None):
+        snapshot = snapshot or {}
+        channels = snapshot.get("sales_channels", [])
+        categories = snapshot.get("category_options", [])
+        assignments = list_product_category_assignments(session, int(product_id)) if product_id else []
+        assignment_by_code = {item.get("sales_channel_code"): item for item in assignments}
+        listing_codes: set[str] = set()
+        if product_id:
+            detail = get_product_detail(session, int(product_id), include_sdb=False)
+            for row in (detail or {}).get("channel_listings", []):
+                if row.get("sales_channel_code"):
+                    listing_codes.add(str(row["sales_channel_code"]))
+        options = []
+        status_parts = []
+        for channel in channels:
+            code = channel.get("code")
+            if not code:
+                continue
+            category_count = len([item for item in categories if item.get("sales_channel_code") == code])
+            assigned_count = len((assignment_by_code.get(code) or {}).get("category_ids") or [])
+            listed = code in listing_codes
+            label = f"{channel.get('name')} ({code}) · {assigned_count} Produkt-Kategorien"
+            if category_count == 0:
+                label += " · kein Kategoriebaum"
+            if listed:
+                label += " · Produkt im Kanal"
+            options.append({"label": label, "value": code})
+            if listed or assigned_count:
+                status_parts.append(f"{channel.get('name') or code}: Listing {'ja' if listed else 'nein'}, Kategorien {assigned_count}, Kategoriebaum {category_count}")
+        status = " · ".join(status_parts) if status_parts else "Produkt ist noch keinem Vertriebskanal zugeordnet oder es sind keine Kategoriezuordnungen vorhanden."
+        return options, status
+
+    @app.callback(
+        Output("category-products-target-category-id", "options"),
+        Output("category-products-target-category-id", "value"),
+        Input("snapshot-store", "data"),
+        Input("categories-sales-channel-code", "value"),
+        Input("selected-category-id", "data"),
+    )
+    def load_category_product_move_target_options(
+        snapshot: dict | None,
+        sales_channel_code: str | None,
+        selected_category_id: int | None,
+    ):
+        snapshot = snapshot or {}
+        options = _filter_category_options_for_channel(snapshot.get("category_options", []), sales_channel_code)
+        return options, selected_category_id
+
+    @app.callback(
+        Output("category-products-active-product-id", "value"),
+        Input("category-products-grid", "cellClicked"),
+        prevent_initial_call=True,
+    )
+    def select_category_product_id_for_actions(cell_event: dict | None):
+        row = (cell_event or {}).get("data") or {}
+        product_id = row.get("id")
+        return int(product_id) if product_id not in {None, ""} else no_update
+
+    @app.callback(
         Output("category-products-grid", "rowData"),
         Output("category-products-status", "children"),
         Output("category-breadcrumb", "children"),
@@ -8918,6 +9143,51 @@ def register_callbacks(app: Dash) -> None:
             return message, message, no_update
         message = f"{count} Position(en) gespeichert."
         return message, message, (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("category-products-status", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Output("selected-category-id", "data", allow_duplicate=True),
+        Output("category-products-grid", "selectedRows", allow_duplicate=True),
+        Input("category-products-move-selected-button", "n_clicks"),
+        State("selected-category-id", "data"),
+        State("category-products-target-category-id", "value"),
+        State("category-products-active-product-id", "value"),
+        State("category-products-grid", "selectedRows"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def move_selected_category_products_by_button(
+        session: Session,
+        _clicks: int | None,
+        source_category_id: int | None,
+        target_category_id: int | None,
+        active_product_id: int | None,
+        selected_rows: list[dict] | None,
+        refresh_token: int | None,
+    ):
+        if not source_category_id:
+            return "Bitte zuerst Quell-Kategorie auswählen.", no_update, no_update, no_update, no_update
+        if not target_category_id:
+            return "Bitte Ziel-Kategorie auswählen.", no_update, no_update, no_update, no_update
+        product_ids = [int(active_product_id)] if active_product_id else [int(row["id"]) for row in (selected_rows or []) if row.get("id") is not None]
+        if not product_ids:
+            return "Bitte mindestens ein Produkt in der Tabelle auswählen.", no_update, no_update, no_update, no_update
+        try:
+            result = move_products_to_category(
+                session,
+                product_ids,
+                int(target_category_id),
+                source_category_id=int(source_category_id),
+            )
+        except ValueError as exc:
+            return str(exc), str(exc), no_update, no_update, no_update
+        moved = int(result.get("moved") or 0)
+        target_name = result.get("target_category_name") or result.get("target_category_id")
+        message = f"{moved} Produkt(e) nach {target_name} verschoben."
+        return message, message, (refresh_token or 0) + 1, int(target_category_id), []
 
     @app.callback(
         Output("translation-language", "value"),
@@ -8996,6 +9266,31 @@ def register_callbacks(app: Dash) -> None:
         if not sales_channel_id:
             return options
         return [item for item in options if item.get("sales_channel_id") == sales_channel_id]
+
+    @app.callback(
+        Output("medusa-category-channel-category-id", "options"),
+        Output("medusa-category-channel-category-id", "value"),
+        Output("medusa-position-channel-category-id", "options"),
+        Output("medusa-position-channel-category-id", "value"),
+        Input("medusa-category-sales-channel-id", "value"),
+        Input("medusa-position-sales-channel-id", "value"),
+        Input("snapshot-store", "data"),
+        State("medusa-category-channel-category-id", "value"),
+        State("medusa-position-channel-category-id", "value"),
+    )
+    def filter_medusa_channel_category_options(
+        category_sales_channel_id: int | None,
+        position_sales_channel_id: int | None,
+        snapshot: dict | None,
+        current_category_id: int | None,
+        current_position_category_id: int | None,
+    ):
+        options = (snapshot or {}).get("category_options", [])
+        category_options = _filter_category_options_by_sales_channel_id(options, category_sales_channel_id)
+        position_options = _filter_category_options_by_sales_channel_id(options, position_sales_channel_id)
+        category_value = current_category_id if current_category_id in {item.get("value") for item in category_options} else None
+        position_value = current_position_category_id if current_position_category_id in {item.get("value") for item in position_options} else None
+        return category_options, category_value, position_options, position_value
 
     @app.callback(
         Output("variants-grid", "rowData"),
@@ -9429,7 +9724,7 @@ def register_callbacks(app: Dash) -> None:
         if not category_id:
             return "Bitte zuerst Kategorie auswählen.", no_update, no_update
         product_ids = [int(item) for item in (value.get("product_ids") or [])]
-        target_product_id = _safe_int(value.get("target_product_id"))
+        target_product_id = _int_or_none(value.get("target_product_id"))
         if not product_ids or not target_product_id:
             return "Keine Produktposition für Sortierung erkannt.", no_update, no_update
         ordered_ids = _reordered_product_ids_for_drop(product_rows, product_ids, target_product_id, value.get("position"))
@@ -9603,7 +9898,7 @@ def register_callbacks(app: Dash) -> None:
             product_id = current_product_id
         if not product_id:
             return None, None, None, None, "draft", "en", False, DEFAULT_CATEGORY_CHANNEL_CODE, None, None, None, None, "Kein Produkt gewählt.", [], [], [], [], [], [], [], [], [], "Keine Assets vorhanden.", "Keine Asset-Vorschau vorhanden."
-        detail = get_product_detail(session, int(product_id))
+        detail = get_product_detail(session, int(product_id), include_sdb=False)
         if detail is None:
             return None, None, None, None, "draft", "en", False, DEFAULT_CATEGORY_CHANNEL_CODE, None, None, None, None, "Produkt nicht gefunden.", [], [], [], [], [], [], [], [], [], "Keine Assets vorhanden.", "Keine Asset-Vorschau vorhanden."
         asset_links = _render_asset_links(detail["assets"])
@@ -9742,7 +10037,7 @@ def register_callbacks(app: Dash) -> None:
     def load_chemical_detail(session: Session, product_id: int | None, _: int | None):
         if not product_id:
             return _empty_chemistry_detail("Kein Chemieprodukt ausgewählt.")
-        detail = get_product_detail(session, int(product_id))
+        detail = get_product_detail(session, int(product_id), include_sdb=False)
         if detail is None:
             return _empty_chemistry_detail("Chemieprodukt nicht gefunden.")
         asset_options = [
@@ -9831,7 +10126,7 @@ def register_callbacks(app: Dash) -> None:
     def load_chemical_enrichment_detail(session: Session, product_id: int | None, _: int | None):
         if not product_id:
             return None, "Bitte zuerst ein Produkt auswählen.", html.Div("Noch keine Anreicherungs-Läufe."), html.Div("Keine gefundenen Dokumente."), html.Div("Keine Vorschau."), [], "Kein Produkt ausgewählt."
-        detail = get_product_detail(session, int(product_id))
+        detail = get_product_detail(session, int(product_id), include_sdb=False)
         if detail is None:
             return None, "Chemieprodukt nicht gefunden.", html.Div("Noch keine Anreicherungs-Läufe."), html.Div("Keine gefundenen Dokumente."), html.Div("Keine Vorschau."), [], "Chemieprodukt nicht gefunden."
         latest = get_latest_product_chemical_enrichment(session, int(product_id))
@@ -9906,7 +10201,7 @@ def register_callbacks(app: Dash) -> None:
     def enrich_wgk_storage_from_sdb(session: Session, _clicks: int | None, product_id: int | None):
         if not product_id:
             return {}, "Kein Chemieprodukt ausgewählt."
-        detail = get_product_detail(session, int(product_id))
+        detail = get_product_detail(session, int(product_id), include_sdb=False)
         if detail is None:
             return {}, "Chemieprodukt nicht gefunden."
         sdb_data = get_product_sdb(session, int(product_id))
@@ -9988,7 +10283,7 @@ def register_callbacks(app: Dash) -> None:
     def load_chemical_sdb_detail(session: Session, product_id: int | None, _: int | None):
         if not product_id:
             return _empty_chemistry_sdb_detail("Kein Chemieprodukt ausgewählt.")
-        detail = get_product_detail(session, int(product_id))
+        detail = get_product_detail(session, int(product_id), include_sdb=False)
         if detail is None:
             return _empty_chemistry_sdb_detail("Chemieprodukt nicht gefunden.")
         sdb_data = get_product_sdb(session, int(product_id))
@@ -10673,7 +10968,7 @@ def register_callbacks(app: Dash) -> None:
     ):
         if not product_id or not sku or not title or not status:
             return "Produkt-ID, SKU, Titel und Status sind Pflicht.", no_update
-        detail = get_product_detail(session, int(product_id))
+        detail = get_product_detail(session, int(product_id), include_sdb=False)
         if detail is None:
             return "Chemieprodukt nicht gefunden.", no_update
         try:
@@ -11057,7 +11352,7 @@ def register_callbacks(app: Dash) -> None:
         if product is None:
             return "Chemieprodukt nicht gefunden.", no_update, no_update, no_update
         stored_sdb = get_product_sdb(session, int(product_id))
-        product_detail = get_product_detail(session, int(product_id)) or {}
+        product_detail = get_product_detail(session, int(product_id), include_sdb=False) or {}
         product_context = {
             "un_number": product_detail.get("un_number") or product.un_number,
             "hazard_class": product_detail.get("hazard_class") or product.hazard_class,
@@ -11737,7 +12032,7 @@ def register_callbacks(app: Dash) -> None:
         if not product_id or not sku:
             return "Kein Chemieprodukt ausgewählt.", no_update, no_update, no_update
         stored_sdb = get_product_sdb(session, int(product_id))
-        product_detail = get_product_detail(session, int(product_id)) or {}
+        product_detail = get_product_detail(session, int(product_id), include_sdb=False) or {}
         product_context = {
             "product_name": product_title or sku,
             "product_title": product_title or sku,
@@ -12133,7 +12428,7 @@ def register_callbacks(app: Dash) -> None:
         product_id = row.get("id")
         if not product_id:
             return no_update, no_update
-        detail = get_product_detail(session, int(product_id))
+        detail = get_product_detail(session, int(product_id), include_sdb=False)
         if detail is None:
             return "Produkt nicht gefunden.", no_update
         update_product(

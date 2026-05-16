@@ -5,8 +5,15 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
-from app.db.models import Asset, ChannelCategory, MedusaConnectionConfig, MedusaSyncMapping, MedusaSyncRunItem, Product, ProductCategoryMapping, ProductTranslation, ProductVariant, R2StorageConfig, SalesChannel
+from app.db.models import Asset, Category, ChannelCategory, MedusaConnectionConfig, MedusaSyncMapping, MedusaSyncRunItem, Product, ProductCategoryAssignment, ProductCategoryMapping, ProductTranslation, ProductVariant, R2StorageConfig, SalesChannel
 from app.services.medusa.client import MedusaAdminApiClient, MedusaAuthError
+from app.services.medusa.category_position_service import (
+    MedusaPositionPayloadError,
+    build_medusa_category_product_position_payload,
+    normalize_position,
+    validate_medusa_category_product_position_payload,
+    validate_no_duplicate_products,
+)
 from app.services.medusa.config_service import get_or_create_medusa_connection, save_medusa_connection
 from app.services.medusa.mappers import MedusaPricingMapper, MedusaProductMapper, MedusaVariantMapper, normalize_handle
 from app.services.medusa.sync_service import MedusaSyncService
@@ -238,6 +245,15 @@ class FakeMedusaClient:
         self.writes.append(("translation", translations))
         return {"translation": {"id": f"tr_{reference_id}_{locale_code}"}}
 
+    def create_or_update_category(self, payload):
+        self.writes.append(("category", payload))
+        category_id = payload.get("id") or f"pcat_{payload['handle']}"
+        return {"product_category": {"id": category_id, "handle": payload["handle"]}}
+
+    def sync_category_product_positions(self, payload):
+        self.writes.append(("category_product_positions", payload))
+        return {"success": True, "created": 0, "updated": len(payload["items"]), "skipped": 0, "errors": []}
+
 
 class MissingTranslationRouteClient(FakeMedusaClient):
     def upsert_translation(self, reference, reference_id, locale_code, translations):
@@ -381,6 +397,239 @@ def test_export_writes_medusa_mappings(tmp_path) -> None:
             "metadata": {"pim_variant_id": variant.id, "source": "pim-pam", "price_type": "sale"},
         }
     ]
+
+
+def test_export_channel_categories_writes_medusa_mapping(tmp_path) -> None:
+    session = _session(tmp_path)
+    config = get_or_create_medusa_connection(session)
+    config.api_token_secret = "token"
+    channel = SalesChannel(code="voxster", name="voxster.ch")
+    parent = Category(sales_channel=channel, slug="detachieren", name="Detachieren", sort_order=10)
+    child = Category(sales_channel=channel, parent=parent, slug="detachiermittel", name="Detachiermittel", sort_order=20)
+    session.add_all([channel, parent, child])
+    session.commit()
+    clients: list[FakeMedusaClient] = []
+
+    def factory(config):
+        client = FakeMedusaClient(config)
+        clients.append(client)
+        return client
+
+    result = MedusaSyncService(session, client_factory=factory).export_channel_categories(
+        sales_channel_id=channel.id,
+        dry_run=False,
+    )
+
+    assert result["status"] == "success"
+    assert [payload["handle"] for action, payload in clients[0].writes if action == "category"] == ["detachieren", "detachiermittel"]
+    parent_mapping = session.scalar(select(MedusaSyncMapping).where(MedusaSyncMapping.entity_type == "category", MedusaSyncMapping.local_entity_id == parent.id))
+    child_mapping = session.scalar(select(MedusaSyncMapping).where(MedusaSyncMapping.entity_type == "category", MedusaSyncMapping.local_entity_id == child.id))
+    assert parent_mapping.medusa_id == "pcat_detachieren"
+    assert child_mapping.medusa_id == "pcat_detachiermittel"
+    child_payload = clients[0].writes[1][1]
+    assert child_payload["parent_category_id"] == "pcat_detachieren"
+
+
+def test_product_export_attaches_known_medusa_category_ids(tmp_path) -> None:
+    session = _session(tmp_path)
+    config = get_or_create_medusa_connection(session)
+    config.api_token_secret = "token"
+    channel = SalesChannel(code="voxster", name="voxster.ch")
+    category = ChannelCategory(sales_channel=channel, external_category_id="detachiermittel", name="Detachiermittel")
+    product = Product(sku="SKU-1", handle="demo-product", title="Demo Product", status="active", source_language="de-CH")
+    product.variants.append(ProductVariant(sku="SKU-1", variant_title="Default", price=Decimal("10.00"), currency="CHF"))
+    session.add_all([channel, category, product])
+    session.flush()
+    session.add_all(
+        [
+            ProductCategoryMapping(product_id=product.id, sales_channel_id=channel.id, channel_category_id=category.id, position=30),
+            MedusaSyncMapping(connection_id=config.id, entity_type="channel_category", local_entity_id=category.id, medusa_id="pcat_detachiermittel", status="active"),
+        ]
+    )
+    session.commit()
+    clients: list[FakeMedusaClient] = []
+
+    def factory(config):
+        client = FakeMedusaClient(config)
+        clients.append(client)
+        return client
+
+    result = MedusaSyncService(session, client_factory=factory).export_product(product.id, dry_run=False)
+
+    assert result["status"] == "success"
+    create_product_payload = next(payload for action, payload in clients[0].writes if action == "create_product")
+    assert create_product_payload["categories"] == [{"id": "pcat_detachiermittel"}]
+    assert create_product_payload["metadata"]["pim_category_mappings"] == [
+        {
+            "pimpam_category_id": str(category.id),
+            "medusa_category_id": "pcat_detachiermittel",
+            "sales_channel_id": channel.id,
+            "position": 30,
+        }
+    ]
+
+
+def test_build_category_product_position_payload_prefers_medusa_ids(tmp_path) -> None:
+    session = _session(tmp_path)
+    config = get_or_create_medusa_connection(session)
+    channel = SalesChannel(code="voxster", name="voxster.ch")
+    category = ChannelCategory(sales_channel=channel, external_category_id="detachieren", external_path="Shop > detachieren", name="Detachieren")
+    product_b = Product(sku="B", handle="produkt-b", title="B Produkt", status="active")
+    product_a = Product(sku="A", handle="produkt-a", title="A Produkt", status="active")
+    session.add_all([channel, category, product_b, product_a])
+    session.flush()
+    session.add_all(
+        [
+            ProductCategoryMapping(product_id=product_b.id, sales_channel_id=channel.id, channel_category_id=category.id, position=20),
+            ProductCategoryMapping(product_id=product_a.id, sales_channel_id=channel.id, channel_category_id=category.id, position=10),
+            MedusaSyncMapping(connection_id=config.id, entity_type="sales_channel", local_entity_id=channel.id, medusa_id="sc_voxster", status="active"),
+            MedusaSyncMapping(connection_id=config.id, entity_type="channel_category", local_entity_id=category.id, medusa_id="pcat_detachieren", medusa_handle="detachieren", status="active"),
+            MedusaSyncMapping(connection_id=config.id, entity_type="product", local_entity_id=product_a.id, medusa_id="prod_a", medusa_handle="produkt-a", status="active"),
+            MedusaSyncMapping(connection_id=config.id, entity_type="product", local_entity_id=product_b.id, medusa_id="prod_b", medusa_handle="produkt-b", status="active"),
+        ]
+    )
+    session.commit()
+
+    payload = build_medusa_category_product_position_payload(session, config, channel_category_id=category.id)
+
+    assert payload == {
+        "source": "pim_pam",
+        "product_category_id": "pcat_detachieren",
+        "sales_channel_id": "sc_voxster",
+        "items": [
+            {"position": 10, "product_id": "prod_a"},
+            {"position": 20, "product_id": "prod_b"},
+        ],
+    }
+
+
+def test_build_category_product_position_payload_falls_back_to_handles(tmp_path) -> None:
+    session = _session(tmp_path)
+    config = get_or_create_medusa_connection(session)
+    channel = SalesChannel(code="voxster", name="voxster.ch")
+    category = ChannelCategory(sales_channel=channel, external_category_id="detachieren", name="Detachieren")
+    product = Product(sku="A", handle="produkt-a", title="A Produkt", status="active")
+    session.add_all([channel, category, product])
+    session.flush()
+    session.add(ProductCategoryMapping(product_id=product.id, sales_channel_id=channel.id, channel_category_id=category.id, position=9999))
+    session.commit()
+
+    payload = build_medusa_category_product_position_payload(session, config, channel_category_id=category.id)
+
+    assert payload == {
+        "source": "pim_pam",
+        "category_handle": "detachieren",
+        "sales_channel_handle": "voxster.ch",
+        "items": [{"position": 9999, "product_handle": "produkt-a"}],
+    }
+
+
+def test_category_product_position_payload_validation_rejects_extra_fields() -> None:
+    with pytest.raises(MedusaPositionPayloadError, match="unerlaubte Felder"):
+        validate_medusa_category_product_position_payload(
+            {
+                "product_category_id": "pcat_1",
+                "source": "pim_pam",
+                "items": [{"product_id": "prod_1", "position": 10}],
+                "metadata": {},
+            }
+        )
+
+
+def test_category_product_position_payload_validation_rejects_missing_category_and_product() -> None:
+    with pytest.raises(MedusaPositionPayloadError, match="keine Kategorie"):
+        validate_medusa_category_product_position_payload({"source": "pim_pam", "items": [{"product_id": "prod_1", "position": 10}]})
+    with pytest.raises(MedusaPositionPayloadError, match="keine Produkt-ID"):
+        validate_medusa_category_product_position_payload({"category_handle": "cat", "items": [{"position": 10}]})
+
+
+def test_category_product_position_normalization_and_duplicate_detection() -> None:
+    assert normalize_position(None) == 9999
+    assert normalize_position("") == 9999
+    assert normalize_position("10") == 10
+    with pytest.raises(MedusaPositionPayloadError, match="Kommazahl"):
+        normalize_position(10.5)
+    with pytest.raises(MedusaPositionPayloadError, match="negativ"):
+        normalize_position(-1)
+    with pytest.raises(MedusaPositionPayloadError, match="doppelt"):
+        validate_no_duplicate_products(
+            {
+                "category_handle": "cat",
+                "items": [
+                    {"product_id": "prod_1", "position": 10},
+                    {"product_id": "prod_1", "position": 20},
+                ],
+            }
+        )
+
+
+def test_category_product_position_dry_run_does_not_send(tmp_path) -> None:
+    session = _session(tmp_path)
+    config = get_or_create_medusa_connection(session)
+    channel = SalesChannel(code="voxster", name="voxster.ch")
+    category = ChannelCategory(sales_channel=channel, external_category_id="detachieren", name="Detachieren")
+    product = Product(sku="A", handle="produkt-a", title="A Produkt", status="active")
+    session.add_all([channel, category, product])
+    session.flush()
+    session.add_all(
+        [
+            ProductCategoryMapping(product_id=product.id, sales_channel_id=channel.id, channel_category_id=category.id, position=10),
+            MedusaSyncMapping(connection_id=config.id, entity_type="channel_category", local_entity_id=category.id, medusa_id="pcat_1", status="active"),
+            MedusaSyncMapping(connection_id=config.id, entity_type="product", local_entity_id=product.id, medusa_id="prod_1", status="active"),
+        ]
+    )
+    session.commit()
+    clients: list[FakeMedusaClient] = []
+
+    def factory(config):
+        client = FakeMedusaClient(config)
+        clients.append(client)
+        return client
+
+    result = MedusaSyncService(session, client_factory=factory).sync_category_product_positions(channel_category_ids=[category.id], dry_run=True)
+
+    assert result["status"] == "success"
+    assert clients and clients[0].writes == []
+    item = session.scalar(select(MedusaSyncRunItem).where(MedusaSyncRunItem.run_id == result["run_id"]))
+    assert item.action == "would_sync_positions"
+    assert item.request_payload["product_category_id"] == "pcat_1"
+
+
+def test_category_product_position_sync_sends_endpoint_payload(tmp_path) -> None:
+    session = _session(tmp_path)
+    config = get_or_create_medusa_connection(session)
+    config.api_token_secret = "token"
+    channel = SalesChannel(code="voxster", name="voxster.ch")
+    category = ChannelCategory(sales_channel=channel, external_category_id="detachieren", name="Detachieren")
+    product = Product(sku="A", handle="produkt-a", title="A Produkt", status="active")
+    session.add_all([channel, category, product])
+    session.flush()
+    session.add_all(
+        [
+            ProductCategoryMapping(product_id=product.id, sales_channel_id=channel.id, channel_category_id=category.id, position=10),
+            MedusaSyncMapping(connection_id=config.id, entity_type="channel_category", local_entity_id=category.id, medusa_id="pcat_1", status="active"),
+            MedusaSyncMapping(connection_id=config.id, entity_type="product", local_entity_id=product.id, medusa_id="prod_1", status="active"),
+        ]
+    )
+    session.commit()
+    clients: list[FakeMedusaClient] = []
+
+    def factory(config):
+        client = FakeMedusaClient(config)
+        clients.append(client)
+        return client
+
+    result = MedusaSyncService(session, client_factory=factory).sync_category_product_positions(channel_category_ids=[category.id], dry_run=False)
+
+    assert result["status"] == "success"
+    assert clients[0].writes == [
+        (
+            "category_product_positions",
+            {"source": "pim_pam", "product_category_id": "pcat_1", "sales_channel_handle": "voxster.ch", "items": [{"position": 10, "product_id": "prod_1"}]},
+        )
+    ]
+    item = session.scalar(select(MedusaSyncRunItem).where(MedusaSyncRunItem.run_id == result["run_id"]))
+    assert item.response_payload["updated"] == 1
 
 
 def test_export_skips_variant_without_price_with_clear_message(tmp_path) -> None:

@@ -148,7 +148,6 @@ dagcomponentfuncs.ProductCategoryDragCell = function (props) {
     );
 };
 
-
 dagcomponentfuncs.ProductTitleButton = function (props) {
     const value = props.value || '';
     const onClick = function (event) {

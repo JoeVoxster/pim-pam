@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from slugify import slugify
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db.models import (
     Asset,
@@ -2046,27 +2046,29 @@ def dashboard_counts(session: Session) -> dict[str, int]:
     }
 
 
-def get_product_detail(session: Session, product_id: int) -> dict | None:
+def get_product_detail(session: Session, product_id: int, *, include_sdb: bool = True) -> dict | None:
+    options = [
+        joinedload(Product.brand),
+        selectinload(Product.variants).selectinload(ProductVariant.price_tiers),
+        selectinload(Product.variants).selectinload(ProductVariant.channel_listings).joinedload(VariantChannelListing.sales_channel),
+        selectinload(Product.variants).selectinload(ProductVariant.channel_category_mappings).joinedload(VariantCategoryMapping.sales_channel),
+        selectinload(Product.variants).selectinload(ProductVariant.channel_category_mappings).joinedload(VariantCategoryMapping.channel_category),
+        selectinload(Product.variants).selectinload(ProductVariant.translations),
+        selectinload(Product.assets).joinedload(Asset.variant),
+        selectinload(Product.translations),
+        selectinload(Product.category_links).joinedload(ProductCategoryAssignment.category).joinedload(Category.sales_channel),
+        selectinload(Product.category_links).joinedload(ProductCategoryAssignment.sales_channel),
+        selectinload(Product.channel_listings).joinedload(ProductChannelListing.sales_channel),
+        selectinload(Product.channel_category_mappings).joinedload(ProductCategoryMapping.sales_channel),
+        selectinload(Product.channel_category_mappings).joinedload(ProductCategoryMapping.channel_category),
+        selectinload(Product.chemical_enrichments),
+        selectinload(Product.chemical_documents),
+    ]
+    if include_sdb:
+        options.append(selectinload(Product.sdb_record))
     stmt = (
         select(Product)
-        .options(
-            joinedload(Product.brand),
-            joinedload(Product.variants).joinedload(ProductVariant.price_tiers),
-            joinedload(Product.variants).joinedload(ProductVariant.channel_listings).joinedload(VariantChannelListing.sales_channel),
-            joinedload(Product.variants).joinedload(ProductVariant.channel_category_mappings).joinedload(VariantCategoryMapping.sales_channel),
-            joinedload(Product.variants).joinedload(ProductVariant.channel_category_mappings).joinedload(VariantCategoryMapping.channel_category),
-            joinedload(Product.variants).joinedload(ProductVariant.translations),
-            joinedload(Product.assets).joinedload(Asset.variant),
-            joinedload(Product.translations),
-            joinedload(Product.category_links).joinedload(ProductCategoryAssignment.category).joinedload(Category.sales_channel),
-            joinedload(Product.category_links).joinedload(ProductCategoryAssignment.sales_channel),
-            joinedload(Product.channel_listings).joinedload(ProductChannelListing.sales_channel),
-            joinedload(Product.channel_category_mappings).joinedload(ProductCategoryMapping.sales_channel),
-            joinedload(Product.channel_category_mappings).joinedload(ProductCategoryMapping.channel_category),
-            joinedload(Product.chemical_enrichments),
-            joinedload(Product.chemical_documents),
-            joinedload(Product.sdb_record),
-        )
+        .options(*options)
         .execution_options(populate_existing=True)
         .where(Product.id == product_id)
     )
@@ -2117,7 +2119,7 @@ def get_product_detail(session: Session, product_id: int) -> dict | None:
             _serialize_chemical_enrichment(enrichment)
             for enrichment in product.chemical_enrichments
         ],
-        "sdb": _serialize_product_sdb(product.sdb_record),
+        "sdb": _serialize_product_sdb(product.sdb_record) if include_sdb else None,
         "variants": [
             {
                 "id": variant.id,
@@ -2775,7 +2777,7 @@ def move_products_to_category(
         order_index = {product_id: index for index, product_id in enumerate(ordered_ids)}
         next_order = len(order_index)
         for row in sorted(order_rows, key=lambda item: order_index.get(int(item.product_id), next_order + int(item.id))):
-            row.sort_order = order_index.get(int(row.product_id), next_order)
+            row.sort_order = (order_index.get(int(row.product_id), next_order) + 1) * 10
             if int(row.product_id) not in order_index:
                 next_order += 1
     session.flush()

@@ -220,6 +220,9 @@ class MedusaAdminApiClient:
             json={"reference": reference, "reference_id": reference_id, "locale_code": locale_code, "translations": translations},
         )
 
+    def sync_category_product_positions(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/pim/category-product-positions", json=payload)
+
     def list_products_for_mapping_repair(self) -> list[dict[str, Any]]:
         return self.paginate("/products", params={"limit": 100, "fields": "id,title,handle,external_id,metadata,variants"}, item_key="products")
 
