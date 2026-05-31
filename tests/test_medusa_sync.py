@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
-from app.db.models import Asset, Category, ChannelCategory, MedusaConnectionConfig, MedusaSyncMapping, MedusaSyncRunItem, Product, ProductCategoryAssignment, ProductCategoryMapping, ProductTranslation, ProductVariant, R2StorageConfig, SalesChannel
+from app.db.models import Asset, Category, ChannelCategory, MedusaConnectionConfig, MedusaSyncMapping, MedusaSyncRunItem, Product, ProductCategoryAssignment, ProductCategoryMapping, ProductTranslation, ProductVariant, ProductVariantPriceTier, R2StorageConfig, SalesChannel, VariantTechnicalAttribute, VariantTechnicalAttributeValueTranslation
 from app.services.medusa.client import MedusaAdminApiClient, MedusaAuthError
 from app.services.medusa.category_position_service import (
     MedusaPositionPayloadError,
@@ -96,7 +96,32 @@ def test_product_and_variant_payload_mapping(tmp_path) -> None:
     session = _session(tmp_path)
     config = get_or_create_medusa_connection(session)
     product = Product(id=1, sku="A01-000K", handle="jolly-smak", title="Jolly Smak", status="active", source_language="en")
-    variant = ProductVariant(id=10, product_id=1, sku="A01-000K", variant_title="Jolly Smak 10kg", price=Decimal("74.40"), currency="CHF")
+    variant = ProductVariant(
+        id=10,
+        product_id=1,
+        sku="A01-000K",
+        manufacturer_sku="SUP-10",
+        vendor_description="Supplier description",
+        variant_title="Jolly Smak 10kg",
+        price=Decimal("74.40"),
+        currency="CHF",
+    )
+    variant.technical_attributes = [
+        VariantTechnicalAttribute(
+            attribute_code="rollenlaenge",
+            attribute_name="Rollenlänge",
+            value_number=Decimal("850"),
+            unit="m",
+            sort_order=10,
+        ),
+        VariantTechnicalAttribute(
+            attribute_code="farbe",
+            attribute_name="Farbe",
+            value_text="gelb",
+            sort_order=20,
+            translations=[VariantTechnicalAttributeValueTranslation(language_code="en", value_text="yellow")],
+        ),
+    ]
     channel = SalesChannel(id=1, code="voxster", name="voxster.ch")
     channel_category = ChannelCategory(id=2, sales_channel_id=1, external_category_id="detergents", external_path="Shop > Detergents", name="Detergents")
     mapping = ProductCategoryMapping(product_id=1, sales_channel_id=1, channel_category_id=2, position=70)
@@ -123,6 +148,20 @@ def test_product_and_variant_payload_mapping(tmp_path) -> None:
     assert product_payload.payload["options"] == [{"title": "Variante", "values": ["Jolly Smak 10kg"]}]
     assert variant_payload.payload["sku"] == "A01-000K"
     assert variant_payload.payload["metadata"]["pim_variant_id"] == 10
+    assert variant_payload.payload["metadata"]["product_sku"] == "A01-000K"
+    assert variant_payload.payload["metadata"]["vendor_sku"] == "SUP-10"
+    assert variant_payload.payload["metadata"]["vendor_description"] == "Supplier description"
+    assert variant_payload.payload["metadata"]["technical_attributes"]["rollenlaenge"] == {
+        "name": "Rollenlänge",
+        "value": 850.0,
+        "display_value": "850 m",
+        "sort_order": 10,
+        "value_number": 850.0,
+        "unit": "m",
+    }
+    assert variant_payload.payload["metadata"]["technical_attributes"]["farbe"]["translations"] == {"en": "yellow"}
+    assert variant_payload.payload["metadata"]["technical_attributes_flat"] == {"rollenlaenge": 850.0, "farbe": "gelb"}
+    assert variant_payload.payload["metadata"]["technical_attribute_units"] == {"rollenlaenge": "m"}
     assert variant_payload.payload["options"] == {"Variante": "Jolly Smak 10kg"}
 
 
@@ -195,6 +234,28 @@ def test_price_mapper_uses_medusa_v2_major_unit_amounts(tmp_path) -> None:
     prices = MedusaPricingMapper().variant_prices(variant)
     assert prices[0]["amount"] == 74.4
     assert prices[0]["currency_code"] == "chf"
+
+
+def test_price_mapper_allows_min_quantity_tier_ladders(tmp_path) -> None:
+    session = _session(tmp_path)
+    product = Product(sku="TIER-1", handle="tier-product", title="Tier Product", status="active")
+    variant = ProductVariant(id=10, product=product, sku="TIER-1.01", price=Decimal("56.15"), currency="CHF")
+    variant.price_tiers = [
+        ProductVariantPriceTier(variant=variant, price_type="sale", min_qty=3, max_qty=None, price=Decimal("51.20"), currency="CHF", status="active"),
+        ProductVariantPriceTier(variant=variant, price_type="sale", min_qty=5, max_qty=None, price=Decimal("48.85"), currency="CHF", status="active"),
+        ProductVariantPriceTier(variant=variant, price_type="sale", min_qty=10, max_qty=None, price=Decimal("44.70"), currency="CHF", status="active"),
+    ]
+    session.add(product)
+    session.commit()
+
+    prices = MedusaPricingMapper().variant_prices(variant)
+
+    assert [(row["min_quantity"], row["amount"]) for row in prices] == [
+        (None, 56.15),
+        (3, 51.2),
+        (5, 48.85),
+        (10, 44.7),
+    ]
 
 
 class FakeMedusaClient:

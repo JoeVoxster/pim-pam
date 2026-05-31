@@ -272,7 +272,7 @@ def test_run_pim_import_creates_purchase_tiers_and_cost_prices(tmp_path: Path, m
     assert tiers[1].min_qty == 13
 
 
-def test_run_pim_import_groups_color_family_into_one_product(tmp_path: Path, monkeypatch) -> None:
+def test_run_pim_import_keeps_supplier_skus_as_products(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "pim.db"
     assets_path = tmp_path / "assets"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
@@ -281,7 +281,7 @@ def test_run_pim_import_groups_color_family_into_one_product(tmp_path: Path, mon
     engine = create_engine(f"sqlite:///{db_path}", future=True)
     Base.metadata.create_all(engine)
 
-    clean_file = tmp_path / "family.csv"
+    clean_file = tmp_path / "variants.csv"
     pd.DataFrame(
         [
             {
@@ -310,7 +310,7 @@ def test_run_pim_import_groups_color_family_into_one_product(tmp_path: Path, mon
     with Session(engine, expire_on_commit=False) as session:
         run_pim_import(
             session=session,
-            source_name="family.csv",
+            source_name="variants.csv",
             mapping_config=ImportMappingConfig(price_column_candidates=["price"]),
             clean_file=clean_file,
         )
@@ -320,9 +320,8 @@ def test_run_pim_import_groups_color_family_into_one_product(tmp_path: Path, mon
         products = session.scalars(select(Product)).all()
         variants = session.scalars(select(ProductVariant).order_by(ProductVariant.sku.asc())).all()
 
-    assert len(products) == 1
-    assert products[0].sku == "B01-045XX"
-    assert products[0].family_key == "B01-045XX"
+    assert len(products) == 2
+    assert {product.sku for product in products} == {"B01-045AR", "B01-045BL"}
     assert len(variants) == 2
     assert variants[0].option_name == "Color"
     assert variants[0].option_value in {"Blue", "Orange"}

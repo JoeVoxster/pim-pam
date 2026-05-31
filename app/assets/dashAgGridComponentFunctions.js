@@ -1,5 +1,89 @@
 var dagcomponentfuncs = window.dashAgGridComponentFunctions = window.dashAgGridComponentFunctions || {};
 
+dagcomponentfuncs.ProductSelectFilterHeader = function (props) {
+    const values = (props.values || []).filter(function (value) { return value !== null && value !== undefined; });
+    const labels = props.labels || {};
+    const field = props.column && props.column.getColDef ? props.column.getColDef().field : null;
+    const [selected, setSelected] = React.useState('');
+    const applyFilter = function (value) {
+        if (!props.api || !field) {
+            return;
+        }
+        const currentModel = props.api.getFilterModel ? (props.api.getFilterModel() || {}) : {};
+        if (!value) {
+            delete currentModel[field];
+        } else {
+            currentModel[field] = {
+                filterType: 'text',
+                type: 'equals',
+                filter: value
+            };
+        }
+        props.api.setFilterModel(currentModel);
+        if (props.api.onFilterChanged) {
+            props.api.onFilterChanged();
+        }
+    };
+    const stopGridEvent = function (event) {
+        event.stopPropagation();
+    };
+    return React.createElement(
+        'div',
+        {
+            onClick: stopGridEvent,
+            onMouseDown: stopGridEvent,
+            style: {
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '2px',
+                width: '100%',
+                minWidth: 0,
+                padding: '2px 0'
+            }
+        },
+        React.createElement(
+            'span',
+            {
+                style: {
+                    fontSize: '11px',
+                    fontWeight: '700',
+                    lineHeight: '1.1',
+                    color: '#334155'
+                }
+            },
+            props.displayName || ''
+        ),
+        React.createElement(
+            'select',
+            {
+                value: selected,
+                onClick: stopGridEvent,
+                onMouseDown: stopGridEvent,
+                onChange: function (event) {
+                    const value = event.target.value;
+                    setSelected(value);
+                    applyFilter(value);
+                },
+                style: {
+                    width: '100%',
+                    minWidth: 0,
+                    height: '22px',
+                    border: '1px solid #cbd5e1',
+                    borderRadius: '4px',
+                    background: '#ffffff',
+                    color: '#0f172a',
+                    fontSize: '11px',
+                    padding: '0 2px'
+                }
+            },
+            React.createElement('option', {value: ''}, props.allLabel || 'Alle'),
+            values.map(function (value) {
+                return React.createElement('option', {key: value, value: value}, labels[value] || value);
+            })
+        )
+    );
+};
+
 dagcomponentfuncs.CategoryToggleButton = function (props) {
     const value = props.value || '';
     const hasChildren = !!(props.data && props.data.has_children);
@@ -383,4 +467,21 @@ dagcomponentfuncs.SdbTitleLinkCell = function (props) {
         },
         title
     );
+};
+
+
+dagcomponentfuncs.PercentCell = function (props) {
+    const value = props.value;
+    if (value === null || value === undefined || value === '') {
+        return React.createElement('span', null, '');
+    }
+    const numberValue = Number(value);
+    if (!Number.isFinite(numberValue)) {
+        return React.createElement('span', null, String(value));
+    }
+    const formatted = numberValue.toLocaleString('de-CH', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 2
+    });
+    return React.createElement('span', null, formatted + ' %');
 };

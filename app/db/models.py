@@ -55,11 +55,12 @@ class Product(TimestampMixin, Base):
         UniqueConstraint("handle", name="uq_products_handle"),
         Index("ix_products_brand_id", "brand_id"),
         Index("ix_products_status", "status"),
+        Index("ix_products_status_updated_at", "status", "updated_at"),
+        Index("ix_products_updated_at", "updated_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     sku: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    family_key: Mapped[str | None] = mapped_column(String(255), index=True)
     handle: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     source_language: Mapped[str] = mapped_column(String(12), nullable=False, default="en", server_default="en")
     title: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -171,14 +172,21 @@ class ProductVariant(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("sku", name="uq_product_variants_sku"),
         Index("ix_product_variants_product_id", "product_id"),
+        Index("ix_product_variants_status_updated_at", "status", "updated_at"),
+        Index("ix_product_variants_updated_at", "updated_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
     sku: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    manufacturer_sku: Mapped[str | None] = mapped_column(String(255), index=True)
+    vendor_description: Mapped[str | None] = mapped_column(Text)
     variant_title: Mapped[str | None] = mapped_column(String(500))
     option_name: Mapped[str | None] = mapped_column(String(100))
     option_value: Mapped[str | None] = mapped_column(String(255))
+    sales_unit: Mapped[str | None] = mapped_column(String(64))
+    pack_quantity: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    pack_unit: Mapped[str | None] = mapped_column(String(64))
     packaging: Mapped[str | None] = mapped_column(String(255))
     price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
     currency: Mapped[str | None] = mapped_column(String(3))
@@ -187,6 +195,31 @@ class ProductVariant(TimestampMixin, Base):
     stock_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     barcode: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active", server_default="active", index=True)
+    customs_description_de: Mapped[str | None] = mapped_column(Text)
+    customs_description_en: Mapped[str | None] = mapped_column(Text)
+    origin_country: Mapped[str | None] = mapped_column(String(2), index=True)
+    material_composition: Mapped[str | None] = mapped_column(Text)
+    ch_tariff_code: Mapped[str | None] = mapped_column(String(32), index=True)
+    ch_statistical_key: Mapped[str | None] = mapped_column(String(32))
+    ch_customs_unit_code: Mapped[str | None] = mapped_column(String(32))
+    ch_customs_quantity_per_unit: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    ch_net_mass_kg: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    ch_gross_mass_kg: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    ch_preference_possible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    ch_origin_proof_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    ch_nze_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    ch_nze_code: Mapped[str | None] = mapped_column(String(64))
+    ch_voc_relevant: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    eu_cn_code: Mapped[str | None] = mapped_column(String(32), index=True)
+    eu_taric_code: Mapped[str | None] = mapped_column(String(32), index=True)
+    de_import_code: Mapped[str | None] = mapped_column(String(32), index=True)
+    de_customs_unit_code: Mapped[str | None] = mapped_column(String(32))
+    de_customs_quantity_per_unit: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    eu_export_control_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    dual_use_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    reach_relevant: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    antidumping_relevant: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    customs_notes: Mapped[str | None] = mapped_column(Text)
 
     product: Mapped[Product] = relationship(back_populates="variants")
     assets: Mapped[list["Asset"]] = relationship(back_populates="variant")
@@ -198,32 +231,174 @@ class ProductVariant(TimestampMixin, Base):
         cascade="all, delete-orphan",
         order_by="ProductVariantPriceTier.min_qty.asc()",
     )
+    customs_additional_codes: Mapped[list["VariantCustomsAdditionalCode"]] = relationship(
+        back_populates="variant",
+        cascade="all, delete-orphan",
+        order_by="VariantCustomsAdditionalCode.code.asc()",
+    )
+    technical_attributes: Mapped[list["VariantTechnicalAttribute"]] = relationship(
+        back_populates="variant",
+        cascade="all, delete-orphan",
+        order_by="VariantTechnicalAttribute.sort_order.asc(), VariantTechnicalAttribute.id.asc()",
+    )
+
+
+class VariantTechnicalAttribute(TimestampMixin, Base):
+    __tablename__ = "variant_technical_attributes"
+    __table_args__ = (
+        Index("ix_variant_technical_attributes_variant_id", "variant_id"),
+        Index("ix_variant_technical_attributes_code", "attribute_code"),
+        UniqueConstraint("variant_id", "attribute_code", name="uq_variant_technical_attributes_variant_code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    variant_id: Mapped[int] = mapped_column(ForeignKey("product_variants.id", ondelete="CASCADE"), nullable=False)
+    attribute_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    attribute_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    value_text: Mapped[str | None] = mapped_column(Text)
+    value_number: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
+    unit: Mapped[str | None] = mapped_column(String(32))
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    variant: Mapped[ProductVariant] = relationship(back_populates="technical_attributes")
+    translations: Mapped[list["VariantTechnicalAttributeValueTranslation"]] = relationship(
+        back_populates="technical_attribute",
+        cascade="all, delete-orphan",
+        order_by="VariantTechnicalAttributeValueTranslation.language_code.asc()",
+    )
+
+
+class TechnicalAttributeLabelTranslation(TimestampMixin, Base):
+    __tablename__ = "technical_attribute_label_translations"
+    __table_args__ = (
+        UniqueConstraint("attribute_code", "language_code", name="uq_technical_attr_label_code_lang"),
+        Index("ix_technical_attr_label_code", "attribute_code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attribute_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    language_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
+class VariantTechnicalAttributeValueTranslation(TimestampMixin, Base):
+    __tablename__ = "variant_technical_attribute_value_translations"
+    __table_args__ = (
+        UniqueConstraint("technical_attribute_id", "language_code", name="uq_variant_technical_attr_value_lang"),
+        Index("ix_variant_technical_attr_value_attr_id", "technical_attribute_id"),
+        Index("ix_variant_technical_attr_value_lang", "language_code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    technical_attribute_id: Mapped[int] = mapped_column(ForeignKey("variant_technical_attributes.id", ondelete="CASCADE"), nullable=False)
+    language_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    value_text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    technical_attribute: Mapped[VariantTechnicalAttribute] = relationship(back_populates="translations")
+
+
+class VariantCustomsAdditionalCode(TimestampMixin, Base):
+    __tablename__ = "variant_customs_additional_codes"
+    __table_args__ = (
+        Index("ix_variant_customs_codes_variant_id", "variant_id"),
+        Index("ix_variant_customs_codes_scope", "jurisdiction", "flow", "code"),
+        UniqueConstraint("variant_id", "jurisdiction", "flow", "code", name="uq_variant_customs_codes_scope"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    variant_id: Mapped[int] = mapped_column(ForeignKey("product_variants.id", ondelete="CASCADE"), nullable=False)
+    jurisdiction: Mapped[str] = mapped_column(String(16), nullable=False)
+    flow: Mapped[str] = mapped_column(String(16), nullable=False)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", server_default="active", index=True)
+    source: Mapped[str | None] = mapped_column(String(255))
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    variant: Mapped[ProductVariant] = relationship(back_populates="customs_additional_codes")
+
+
+class PriceList(TimestampMixin, Base):
+    __tablename__ = "price_lists"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_price_lists_code"),
+        Index("ix_price_lists_sales_channel_id", "sales_channel_id"),
+        Index("ix_price_lists_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(500), nullable=False)
+    price_list_type: Mapped[str] = mapped_column(String(50), nullable=False, default="sale", server_default="sale")
+    sales_channel_id: Mapped[int | None] = mapped_column(ForeignKey("sales_channels.id", ondelete="SET NULL"))
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", server_default="active")
+
+    sales_channel: Mapped["SalesChannel | None"] = relationship()
+    prices: Mapped[list["ProductVariantPriceTier"]] = relationship(back_populates="price_list")
+
+
+class CurrencyRate(TimestampMixin, Base):
+    __tablename__ = "currency_rates"
+    __table_args__ = (
+        UniqueConstraint("source_currency", "target_currency", name="uq_currency_rates_pair"),
+        Index("ix_currency_rates_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    target_currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    effective_rate: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    markup_percent: Mapped[Decimal] = mapped_column(Numeric(7, 3), nullable=False, default=0, server_default="0")
+    used_rate: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    rate_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", server_default="active")
+
+
+class CostSurcharge(TimestampMixin, Base):
+    __tablename__ = "cost_surcharges"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_cost_surcharges_code"),
+        Index("ix_cost_surcharges_scope", "scope_type", "scope_value"),
+        Index("ix_cost_surcharges_type_status", "surcharge_type", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(500), nullable=False)
+    surcharge_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(64), nullable=False, default="global", server_default="global")
+    scope_value: Mapped[str | None] = mapped_column(String(255))
+    percent: Mapped[Decimal] = mapped_column(Numeric(7, 3), nullable=False, default=0, server_default="0")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", server_default="active")
 
 
 class ProductVariantPriceTier(TimestampMixin, Base):
     __tablename__ = "product_variant_price_tiers"
     __table_args__ = (
-        UniqueConstraint(
-            "variant_id",
-            "price_type",
-            "currency",
-            "min_qty",
-            "max_qty",
-            name="uq_variant_price_tiers_variant_scope",
-        ),
         Index("ix_variant_price_tiers_variant_id", "variant_id"),
         Index("ix_variant_price_tiers_price_type", "price_type"),
+        Index("ix_variant_price_tiers_price_list_id", "price_list_id"),
+        Index("ix_variant_price_tiers_status", "status"),
+        Index("uq_variant_price_tiers_variant_scope", "variant_id", "price_list_id", "price_type", "currency", "min_qty", "max_qty", unique=True),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     variant_id: Mapped[int] = mapped_column(ForeignKey("product_variants.id", ondelete="CASCADE"), nullable=False)
+    price_list_id: Mapped[int | None] = mapped_column(ForeignKey("price_lists.id", ondelete="SET NULL"))
     price_type: Mapped[str] = mapped_column(String(20), nullable=False, default="sale", server_default="sale")
     min_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     max_qty: Mapped[int | None] = mapped_column(Integer)
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", server_default="active")
 
     variant: Mapped[ProductVariant] = relationship(back_populates="price_tiers")
+    price_list: Mapped[PriceList | None] = relationship(back_populates="prices")
 
 
 class ProductCategoryAssignment(TimestampMixin, Base):
@@ -251,6 +426,8 @@ class Asset(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_assets_product_id", "product_id"),
         Index("ix_assets_variant_id", "variant_id"),
+        Index("ix_assets_sort_created", "sort_order", "created_at"),
+        Index("ix_assets_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -1083,6 +1260,7 @@ class ImportJob(Base):
     __tablename__ = "import_jobs"
     __table_args__ = (
         Index("ix_import_jobs_status", "status"),
+        Index("ix_import_jobs_started_at", "started_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

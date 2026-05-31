@@ -4,24 +4,30 @@ from decimal import Decimal
 import fitz
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
-from app.db.models import Asset, ChemicalDocument, MedusaConnectionConfig, MedusaSyncMapping
+from app.db.models import Asset, Brand, ChemicalDocument, MedusaConnectionConfig, MedusaSyncMapping, Product, ProductVariant, ProductVariantPriceTier, TechnicalAttributeLabelTranslation, VariantTechnicalAttribute, VariantTechnicalAttributeValueTranslation, VariantTranslation
 from app.services.asset_service import create_asset_record
 from app.schemas.pim import (
     ChannelCategoryUpsert,
+    CostSurchargeUpsert,
+    CurrencyRateUpsert,
     ProductCategoryMappingUpsert,
     ProductChannelListingUpdate,
     ProductCreate,
     ProductSDBUpdate,
     ProductTranslationCreate,
     ProductUpdate,
+    TechnicalAttributeLabelTranslationUpsert,
     VariantCategoryMappingUpsert,
     VariantChannelListingUpdate,
+    VariantCustomsAdditionalCodeUpsert,
     VariantCreate,
     VariantPriceTierCreate,
+    VariantTechnicalAttributeUpsert,
+    VariantTechnicalAttributeValueTranslationUpsert,
     VariantTranslationCreate,
     VariantUpdate,
 )
@@ -48,6 +54,7 @@ from app.services.pim_service import (
     get_product_detail,
     get_products_for_category,
     get_products_for_channel_category,
+    hard_delete_product,
     update_product_channel_category_position,
     move_products_to_category,
     get_product_sdb,
@@ -57,27 +64,42 @@ from app.services.pim_service import (
     list_categories,
     list_channel_categories,
     list_channel_export_rows,
+    list_cost_surcharges,
+    list_currency_rates,
+    list_assets,
     list_chemical_products,
     list_product_category_assignments,
     list_products,
     list_variants,
+    next_product_sku,
+    next_variant_sku,
     list_variant_category_mappings,
     list_sales_channels,
+    list_technical_attribute_label_translations,
+    list_variant_technical_attribute_value_translations,
     product_ids_for_variants,
     set_product_translation_short_description,
     set_product_categories,
     set_product_categories_for_channel,
     update_category,
     update_product,
+    move_asset,
     update_variant,
     update_variant_translation_by_id,
     upsert_channel_category,
+    upsert_cost_surcharge,
+    upsert_currency_rate,
     upsert_product_category_mapping,
     upsert_product_channel_listing,
     upsert_variant_category_mapping,
     upsert_product_sdb,
     upsert_product_with_variant,
+    upsert_technical_attribute_label_translation,
     upsert_variant_channel_listing,
+    upsert_variant_customs_additional_code,
+    upsert_variant_technical_attribute,
+    upsert_variant_technical_attribute_value_translation,
+    delete_variant_technical_attribute,
     upsert_variant_price_tier,
     variant_ids_for_products,
 )
@@ -137,7 +159,7 @@ def test_pim_service_create_and_update_product(tmp_path) -> None:
         product, variant = create_product(
             session,
             ProductCreate(sku="SKU-1", title="Demo Product", brand_name="Brand A", status="draft"),
-            VariantCreate(sku="SKU-1", variant_title="Default Variant"),
+            VariantCreate(sku="SKU-1", variant_title="Default Variant", vendor_description="Vendor default"),
         )
         session.commit()
 
@@ -163,6 +185,7 @@ def test_pim_service_create_and_update_product(tmp_path) -> None:
             variant.id,
             VariantUpdate(
                 variant_title="Updated Variant",
+                vendor_description="Vendor updated",
                 price="19.99",
                 cost_price="9.99",
                 currency="EUR",
@@ -195,17 +218,417 @@ def test_pim_service_create_and_update_product(tmp_path) -> None:
     assert detail["chemical_type"] == "Lauge"
     assert detail["cas_number"] == "7681-52-9"
     assert detail["variants"][0]["variant_title"] == "Updated Variant"
+    assert detail["variants"][0]["vendor_description"] == "Vendor updated"
     assert detail["variants"][0]["status"] == "active"
     assert detail["variants"][0]["currency"] == "EUR"
     assert detail["variants"][0]["cost_price"] == 9.99
     assert detail["variants"][0]["margin_percent"] == 50.03
     assert detail["variants"][0]["price_tiers"][1]["min_qty"] == 10
-    assert detail["variants"][0]["price_tiers"][1]["margin_amount"] == 10.49
-    assert detail["variants"][0]["price_tiers"][1]["margin_percent"] == 58.31
+    assert "margin_amount" not in detail["variants"][0]["price_tiers"][1]
+    assert "total_margin_amount" not in detail["variants"][0]["price_tiers"][1]
+    assert "margin_percent" not in detail["variants"][0]["price_tiers"][1]
     assert len(chemistry_rows) == 1
     assert chemistry_rows[0]["cas_number"] == "7681-52-9"
 
 
+def test_variant_technical_attributes_are_serialized_and_deletable(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, variant = create_product(
+            session,
+            ProductCreate(sku="SF-1", title="Schlauchfolie", brand_name="VOXSTER", status="active"),
+            VariantCreate(sku="SF-1.01", variant_title="Schlauchfolie 850 Meter"),
+        )
+        length = upsert_variant_technical_attribute(
+            session,
+            VariantTechnicalAttributeUpsert(
+                variant_id=variant.id,
+                attribute_name="Rollenlänge",
+                value_number="850",
+                unit="m",
+                sort_order=10,
+            ),
+        )
+        material = upsert_variant_technical_attribute(
+            session,
+            VariantTechnicalAttributeUpsert(
+                variant_id=variant.id,
+                attribute_name="Material",
+                value_text="LDPE",
+                sort_order=40,
+            ),
+        )
+        session.commit()
+
+        rows = list_variants(session)
+        detail = get_product_detail(session, product.id)
+        delete_variant_technical_attribute(session, material.id)
+        session.commit()
+        remaining = session.scalars(select(VariantTechnicalAttribute)).all()
+
+    assert length.attribute_code == "rollenlange"
+    assert rows[0]["technical_attributes"][0]["attribute_name"] == "Rollenlänge"
+    assert rows[0]["technical_attributes_metadata"]["rollenlange"] == {
+        "name": "Rollenlänge",
+        "value": 850.0,
+        "display_value": "850 m",
+        "sort_order": 10,
+        "value_number": 850.0,
+        "unit": "m",
+    }
+    assert detail["variants"][0]["technical_attributes"][1]["value_text"] == "LDPE"
+    assert [row.attribute_name for row in remaining] == ["Rollenlänge"]
+
+
+def test_variant_technical_attribute_translations_are_listed(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, variant = create_product(
+            session,
+            ProductCreate(sku="ROLL-1", title="Rolle gelb", brand_name="VOXSTER", status="active"),
+            VariantCreate(sku="ROLL-1.01", variant_title="Rolle gelb"),
+        )
+        attribute = upsert_variant_technical_attribute(
+            session,
+            VariantTechnicalAttributeUpsert(
+                variant_id=variant.id,
+                attribute_code="farbe",
+                attribute_name="Farbe",
+                value_text="gelb",
+                sort_order=100,
+            ),
+        )
+        upsert_technical_attribute_label_translation(
+            session,
+            TechnicalAttributeLabelTranslationUpsert(attribute_code="farbe", language_code="en", label="Color"),
+        )
+        upsert_variant_technical_attribute_value_translation(
+            session,
+            VariantTechnicalAttributeValueTranslationUpsert(technical_attribute_id=attribute.id, language_code="en", value_text="yellow"),
+        )
+        session.commit()
+
+        label_rows = list_technical_attribute_label_translations(session)
+        value_rows = list_variant_technical_attribute_value_translations(session)
+        variant_rows = list_variants(session)
+
+    assert label_rows == [{"id": 1, "attribute_code": "farbe", "language_code": "en", "label": "Color"}]
+    assert value_rows[0]["variant_sku"] == "ROLL-1.01"
+    assert value_rows[0]["attribute_code"] == "farbe"
+    assert value_rows[0]["original_value"] == "gelb"
+    assert value_rows[0]["value_text"] == "yellow"
+    assert variant_rows[0]["technical_attributes"][0]["translations"][0]["value_text"] == "yellow"
+
+
+def test_product_update_creates_and_persists_unknown_brand_name(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="BRAND-FK-1", title="Brand FK Product", brand_name="VOXSTER", status="draft"),
+            VariantCreate(sku="BRAND-FK-1.01", variant_title="Default Variant"),
+        )
+        session.commit()
+
+        update_product(
+            session,
+            product.id,
+            ProductUpdate(
+                sku="BRAND-FK-1",
+                title="Brand FK Product",
+                brand_name="Gmöhling",
+                status="draft",
+                source_language="en",
+                category_ids=[],
+            ),
+        )
+        session.commit()
+        detail = get_product_detail(session, product.id)
+        brand = session.scalar(select(Brand).where(Brand.name == "Gmöhling"))
+
+    assert brand is not None
+    assert detail["brand_name"] == "Gmöhling"
+
+
+def test_calculation_rates_and_surcharges_feed_tier_margin(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, variant = create_product(
+            session,
+            ProductCreate(sku="1000", title="Demo Product", brand_name="Tintolav", status="draft"),
+            VariantCreate(sku="1000.01", variant_title="Default Variant", price="20.00", currency="CHF", cost_price="10.00", cost_currency="EUR"),
+        )
+        upsert_currency_rate(
+            session,
+            CurrencyRateUpsert(
+                source_currency="EUR",
+                target_currency="CHF",
+                effective_rate=Decimal("1.05"),
+                markup_percent=Decimal("0.5"),
+                used_rate=Decimal("1.10"),
+                rate_date="24.05.2026",
+            ),
+        )
+        upsert_cost_surcharge(
+            session,
+            CostSurchargeUpsert(code="transport_tintolav", name="Transport Tintolav", surcharge_type="transport", scope_type="supplier", scope_value="Tintolav", percent=Decimal("10")),
+        )
+        upsert_variant_price_tier(
+            session,
+            VariantPriceTierCreate(variant_id=variant.id, min_qty=3, max_qty=None, price="20.00", currency="CHF", price_type="sale"),
+        )
+        session.commit()
+
+        detail = get_product_detail(session, product.id)
+        rates = list_currency_rates(session)
+        surcharges = list_cost_surcharges(session)
+
+    sale_tier = next(tier for tier in detail["variants"][0]["price_tiers"] if tier["price_type"] == "sale")
+    assert rates[0]["rate_date"].startswith("2026-05-24")
+    assert rates[0]["calculated_rate"] == 1.05525
+    assert surcharges[0]["factor"] == 1.1
+    assert sale_tier["calc_cost"] == 12.1
+    assert sale_tier["calc_margin_amount"] == 7.9
+    assert sale_tier["calc_margin_percent"] == 39.5
+    assert sale_tier["calc_total_margin_amount"] == 23.7
+
+
+def test_tier_margin_uses_matching_purchase_tier_in_different_currency(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, variant = create_product(
+            session,
+            ProductCreate(sku="1000", title="Demo Product", status="draft"),
+            VariantCreate(sku="1000.01", variant_title="Default Variant", price="8.73", currency="CHF", cost_price="5.33", cost_currency="CHF"),
+        )
+        upsert_currency_rate(
+            session,
+            CurrencyRateUpsert(
+                source_currency="EUR",
+                target_currency="CHF",
+                effective_rate=Decimal("0.91"),
+                markup_percent=Decimal("1.0"),
+                used_rate=Decimal("0.93"),
+                rate_date="24.05.2026",
+            ),
+        )
+        upsert_variant_price_tier(
+            session,
+            VariantPriceTierCreate(variant_id=variant.id, min_qty=1, max_qty=999, price="5.45", currency="EUR", price_type="purchase"),
+        )
+        upsert_variant_price_tier(
+            session,
+            VariantPriceTierCreate(variant_id=variant.id, min_qty=1, max_qty=None, price="8.73", currency="CHF", price_type="sale"),
+        )
+        session.commit()
+
+        detail = get_product_detail(session, product.id)
+
+    sale_tier = next(tier for tier in detail["variants"][0]["price_tiers"] if tier["price_type"] == "sale")
+    assert sale_tier["calc_purchase_price"] == 5.45
+    assert sale_tier["calc_purchase_currency"] == "EUR"
+    assert sale_tier["calc_fx_rate"] == 0.93
+
+
+def test_country_cost_surcharge_matches_variant_origin_country(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, variant = create_product(
+            session,
+            ProductCreate(sku="1000", title="Demo Product", status="draft"),
+            VariantCreate(sku="1000.01", variant_title="Default Variant", price="10.00", currency="CHF", cost_price="5.00", cost_currency="CHF", origin_country="IT"),
+        )
+        upsert_cost_surcharge(
+            session,
+            CostSurchargeUpsert(code="transport_it", name="Transport Italien", surcharge_type="transport", scope_type="country", scope_value="IT", percent=Decimal("10")),
+        )
+        upsert_variant_price_tier(
+            session,
+            VariantPriceTierCreate(variant_id=variant.id, min_qty=1, max_qty=None, price="10.00", currency="CHF", price_type="sale"),
+        )
+        session.commit()
+
+        detail = get_product_detail(session, product.id)
+
+    sale_tier = next(tier for tier in detail["variants"][0]["price_tiers"] if tier["price_type"] == "sale")
+    assert "Transport Italien: 10" in sale_tier["calc_surcharges"]
+    assert sale_tier["calc_cost"] == 5.5
+
+
+def test_variant_customs_data_and_additional_codes_are_variant_level(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, variant = create_product(
+            session,
+            ProductCreate(sku="CUST-1", title="Customs Product", status="ready"),
+            VariantCreate(
+                sku="CUST-1.01",
+                variant_title="1 l",
+                origin_country="it",
+                customs_description_de="Fleckenentferner",
+                ch_tariff_code="3402.9000",
+                ch_customs_unit_code="kg",
+                ch_customs_quantity_per_unit=Decimal("1.250"),
+                ch_net_mass_kg=Decimal("1.000"),
+                ch_gross_mass_kg=Decimal("1.150"),
+                ch_preference_possible=True,
+                eu_cn_code="34029090",
+                eu_taric_code="3402909000",
+                de_import_code="34029090000",
+            ),
+        )
+        upsert_variant_customs_additional_code(
+            session,
+            VariantCustomsAdditionalCodeUpsert(
+                variant_id=variant.id,
+                jurisdiction="EU",
+                flow="export",
+                code="Y901",
+                description="Negativcodierung",
+                valid_from="24.05.2026",
+            ),
+        )
+        session.commit()
+
+        rows = list_variants(session)
+        detail = get_product_detail(session, product.id)
+
+    row = rows[0]
+    assert row["origin_country"] == "IT"
+    assert row["ch_tariff_code"] == "3402.9000"
+    assert row["ch_customs_quantity_per_unit"] == 1.25
+    assert row["ch_preference_possible"] is True
+    assert row["customs_additional_codes"][0]["jurisdiction"] == "EU"
+    assert row["customs_additional_codes"][0]["flow"] == "export"
+    assert row["customs_additional_codes"][0]["code"] == "Y901"
+    assert row["customs_additional_codes"][0]["valid_from"].startswith("2026-05-24")
+    assert detail["variants"][0]["customs_description_de"] == "Fleckenentferner"
+
+
+def test_auto_sku_generation_uses_product_sku_and_variant_suffix(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, variant = create_product(session, ProductCreate(title="Auto SKU", status="draft"), VariantCreate(variant_title="Standard"))
+        assert product.sku == "1000"
+        assert variant is not None
+        assert variant.sku == "1000.01"
+        assert isinstance(variant.sku, str)
+
+        _same_product, second_variant = upsert_product_with_variant(
+            session,
+            sku=product.sku,
+            source_language="en",
+            title=product.title,
+            description=None,
+            source_url=None,
+            source_url_final=None,
+            specifications_text=None,
+            technical_features_text=None,
+            brand_name=None,
+            status="draft",
+            variant_sku="",
+            variant_title="Zweite Variante",
+            option_name=None,
+            option_value=None,
+            packaging=None,
+            price=None,
+            currency=None,
+            cost_price=None,
+            cost_currency=None,
+            barcode=None,
+        )
+        assert second_variant.sku == "1000.02"
+
+        next_product, next_variant = create_product(session, ProductCreate(title="Naechstes Produkt", status="draft"), VariantCreate(variant_title="Standard"))
+        assert next_product.sku == "1001"
+        assert next_variant is not None
+        assert next_variant.sku == "1001.01"
+
+        existing_product, existing_variant = create_product(
+            session,
+            ProductCreate(sku="LEGACY-1", title="Legacy", status="ready"),
+            VariantCreate(sku="LEGACY-1-A", variant_title="Legacy A"),
+        )
+        assert existing_product.sku == "LEGACY-1"
+        assert existing_variant is not None
+        assert existing_variant.sku == "LEGACY-1-A"
+
+        create_product(session, ProductCreate(sku="9999", title="Grenze", status="ready"), VariantCreate(sku="9999.99", variant_title="99"))
+        assert next_product_sku(session) == "10000"
+
+
+def test_hard_delete_product_removes_dependents_and_requires_confirmation(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+    asset_dir = tmp_path / "assets"
+    asset_dir.mkdir()
+    asset_file = asset_dir / "product.pdf"
+    asset_file.write_bytes(b"%PDF-1.4\n")
+
+    with SessionLocal() as session:
+        ensure_default_sales_channels(session)
+        product, variant = create_product(
+            session,
+            ProductCreate(sku="DEL-1", title="Delete Product", status="ready"),
+            VariantCreate(sku="DEL-1.01", variant_title="Standard"),
+        )
+        assert variant is not None
+        asset = create_asset_record(session, asset_file, product_id=product.id, variant_id=variant.id)
+        create_or_update_translation(session, ProductTranslationCreate(product_id=product.id, language_code="de-CH", title="Deutsch"))
+        create_or_update_variant_translation(session, VariantTranslationCreate(variant_id=variant.id, language_code="de-CH", title="Variante"))
+        upsert_variant_price_tier(session, VariantPriceTierCreate(variant_id=variant.id, price_type="sale", min_qty=1, price="10.00", currency="CHF"))
+        channel = list_sales_channels(session)[0]
+        upsert_product_channel_listing(session, ProductChannelListingUpdate(product_id=product.id, sales_channel_id=channel["id"], allowed=True, is_active=True, publication_status="published"))
+        upsert_variant_channel_listing(session, VariantChannelListingUpdate(variant_id=variant.id, sales_channel_id=channel["id"], allowed=True, is_active=True, publication_status="published"))
+        session.add(MedusaConnectionConfig(id=1, name="default"))
+        session.flush()
+        session.add(MedusaSyncMapping(connection_id=1, entity_type="product", local_entity_id=product.id, medusa_id="prod_1"))
+        session.add(MedusaSyncMapping(connection_id=1, entity_type="variant", local_entity_id=variant.id, medusa_id="variant_1"))
+        session.flush()
+
+        with pytest.raises(ValueError):
+            hard_delete_product(session, product.id, "wrong")
+        assert session.get(Product, product.id) is not None
+
+        result = hard_delete_product(session, product.id, product.sku)
+        session.commit()
+
+    assert result["variants_deleted"] == 1
+    assert result["assets_deleted"] == 1
+    assert not asset_file.exists()
+    with SessionLocal() as session:
+        assert session.get(Product, product.id) is None
+        assert session.get(ProductVariant, variant.id) is None
+        assert session.get(Asset, asset.id) is None
+        assert session.scalar(select(ProductTranslation).where(ProductTranslation.product_id == product.id)) is None
+        assert session.scalar(select(VariantTranslation).where(VariantTranslation.variant_id == variant.id)) is None
+        assert session.scalar(select(ProductVariantPriceTier).where(ProductVariantPriceTier.variant_id == variant.id)) is None
+        assert session.scalar(select(MedusaSyncMapping).where(MedusaSyncMapping.local_entity_id.in_([product.id, variant.id]))) is None
 def test_product_detail_includes_readonly_medusa_mapping_ids(tmp_path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
     Base.metadata.create_all(engine)
@@ -690,7 +1113,19 @@ def test_export_medusa_products_uses_selected_products_and_translation(tmp_path)
                 status="active",
                 source_language="en",
             ),
-            VariantCreate(sku="MED-1-A", variant_title="Default", price=Decimal("12.90"), currency="CHF", barcode="761000000001"),
+            VariantCreate(
+                sku="MED-1-A",
+                variant_title="Default",
+                price=Decimal("54.20"),
+                currency="CHF",
+                cost_price=Decimal("39.40"),
+                cost_currency="EUR",
+                barcode="761000000001",
+                sales_unit="Packung",
+                pack_quantity=Decimal("20"),
+                pack_unit="Block",
+                packaging="1 Packung mit 20 Blöcken",
+            ),
         )
         create_or_update_translation(
             session,
@@ -700,6 +1135,24 @@ def test_export_medusa_products_uses_selected_products_and_translation(tmp_path)
                 title="Deutscher Titel",
                 description="Deutsche Beschreibung",
                 slug="deutscher-titel",
+            ),
+        )
+        attr = upsert_variant_technical_attribute(
+            session,
+            VariantTechnicalAttributeUpsert(
+                variant_id=variant.id,
+                attribute_code="farbe",
+                attribute_name="Farbe",
+                value_text="gelb",
+                sort_order=20,
+            ),
+        )
+        upsert_variant_technical_attribute_value_translation(
+            session,
+            VariantTechnicalAttributeValueTranslationUpsert(
+                technical_attribute_id=attr.id,
+                language_code="en",
+                value_text="yellow",
             ),
         )
         voxster = next(channel for channel in ensure_default_sales_channels(session) if channel.code == "voxster")
@@ -737,7 +1190,17 @@ def test_export_medusa_products_uses_selected_products_and_translation(tmp_path)
     assert metadata["pim_category_sort_positions"][0]["channel_category_id"] == channel_category.id
     assert metadata["pim_category_sort_positions"][0]["position"] == 70
     assert str(frame.loc[0, "Variant Barcode"]) == "761000000001"
-    assert frame.loc[0, "Variant Price CHF"] == 12.9
+    assert frame.loc[0, "Variant Price CHF"] == 54.2
+    variant_metadata = json.loads(frame.loc[0, "Variant Metadata"])
+    assert variant_metadata["sales_unit"] == "Packung"
+    assert variant_metadata["pack_quantity"] == "20"
+    assert variant_metadata["pack_unit"] == "Block"
+    assert variant_metadata["unit_price"] == "2.7100"
+    assert variant_metadata["unit_cost"] == "1.9700"
+    assert variant_metadata["technical_attributes"]["farbe"]["name"] == "Farbe"
+    assert variant_metadata["technical_attributes"]["farbe"]["value"] == "gelb"
+    assert variant_metadata["technical_attributes"]["farbe"]["translations"] == {"en": "yellow"}
+    assert variant_metadata["technical_attributes_flat"] == {"farbe": "gelb"}
 
 
 def test_export_medusa_products_builds_r2_image_url_from_current_public_base_url(tmp_path) -> None:
@@ -1156,7 +1619,6 @@ def test_bulk_channel_actions_are_idempotent_and_resolve_related_variants(tmp_pa
         _product, variant_b = upsert_product_with_variant(
             session,
             sku="BULK-1",
-            family_key=None,
             source_language="en",
             title="Bulk Product",
             description=None,
@@ -1298,7 +1760,6 @@ def test_channel_category_tree_builds_multiple_levels_and_products_are_scoped(tm
         _product, _variant_b = upsert_product_with_variant(
             session,
             sku="TREE-1",
-            family_key=None,
             source_language="en",
             title="Tree Product",
             description=None,
@@ -1710,17 +2171,37 @@ def test_bulk_update_variants_supports_preview_apply_and_only_empty(tmp_path) ->
         preview = bulk_update_variants(
             session,
             [variant.id],
-            {"status": "active", "price": "9.50", "currency": "CHF", "option_name": "Packaging", "option_value": "10 kg", "packaging": "10 kg Kanister"},
+            {
+                "status": "active",
+                "price": "9.50",
+                "currency": "CHF",
+                "option_name": "Packaging",
+                "option_value": "10 kg",
+                "sales_unit": "Packung",
+                "pack_quantity": "20",
+                "pack_unit": "Block",
+                "packaging": "1 Packung mit 20 Blöcken",
+            },
             apply=False,
             backup_dir=tmp_path,
         )
-        assert preview["updated"] == 5
+        assert preview["updated"] == 8
         assert session.get(type(variant), variant.id).currency == "EUR"
 
         applied = bulk_update_variants(
             session,
             [variant.id],
-            {"status": "active", "price": "9.50", "currency": "CHF", "option_name": "Packaging", "option_value": "10 kg", "packaging": "10 kg Kanister"},
+            {
+                "status": "active",
+                "price": "9.50",
+                "currency": "CHF",
+                "option_name": "Packaging",
+                "option_value": "10 kg",
+                "sales_unit": "Packung",
+                "pack_quantity": "20",
+                "pack_unit": "Block",
+                "packaging": "1 Packung mit 20 Blöcken",
+            },
             apply=True,
             backup_dir=tmp_path,
         )
@@ -1739,6 +2220,9 @@ def test_bulk_update_variants_supports_preview_apply_and_only_empty(tmp_path) ->
             "currency": updated.currency,
             "option_name": updated.option_name,
             "option_value": updated.option_value,
+            "sales_unit": updated.sales_unit,
+            "pack_quantity": updated.pack_quantity,
+            "pack_unit": updated.pack_unit,
             "packaging": updated.packaging,
         }
 
@@ -1749,7 +2233,10 @@ def test_bulk_update_variants_supports_preview_apply_and_only_empty(tmp_path) ->
         "currency": "CHF",
         "option_name": "Packaging",
         "option_value": "10 kg",
-        "packaging": "10 kg Kanister",
+        "sales_unit": "Packung",
+        "pack_quantity": Decimal("20.000"),
+        "pack_unit": "Block",
+        "packaging": "1 Packung mit 20 Blöcken",
     }
 
 
@@ -1908,6 +2395,76 @@ def test_delete_assets_handles_multiple_ids_and_reports_errors(tmp_path) -> None
     assert result["errors"][0]["asset_id"] == 999999
     assert not asset_a.exists()
     assert not asset_b.exists()
+
+
+def test_move_asset_reorders_product_assets(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    asset_dir = tmp_path / "assets"
+    asset_dir.mkdir()
+    asset_a = asset_dir / "a.txt"
+    asset_b = asset_dir / "b.txt"
+    asset_c = asset_dir / "c.txt"
+    asset_a.write_text("a", encoding="utf-8")
+    asset_b.write_text("b", encoding="utf-8")
+    asset_c.write_text("c", encoding="utf-8")
+
+    with SessionLocal() as session:
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="ASSET-MOVE", title="Asset Move Product", brand_name="VOXSTER", status="draft"),
+            VariantCreate(sku="ASSET-MOVE-1", variant_title="Default Variant"),
+        )
+        first = create_asset_record(session, asset_a, product_id=product.id)
+        second = create_asset_record(session, asset_b, product_id=product.id)
+        third = create_asset_record(session, asset_c, product_id=product.id)
+        session.commit()
+
+        move_asset(session, third.id, "up")
+        session.commit()
+        detail = get_product_detail(session, product.id)
+        ordered_ids = [asset["id"] for asset in detail["assets"]]
+        ordered_sort = [asset["sort_order"] for asset in detail["assets"]]
+
+    assert ordered_ids == [first.id, third.id, second.id]
+    assert ordered_sort == [0, 1, 2]
+
+
+def test_move_asset_reorders_variant_assets(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    asset_dir = tmp_path / "assets"
+    asset_dir.mkdir()
+    asset_a = asset_dir / "variant-a.txt"
+    asset_b = asset_dir / "variant-b.txt"
+    asset_c = asset_dir / "variant-c.txt"
+    asset_a.write_text("a", encoding="utf-8")
+    asset_b.write_text("b", encoding="utf-8")
+    asset_c.write_text("c", encoding="utf-8")
+
+    with SessionLocal() as session:
+        _product, variant = create_product(
+            session,
+            ProductCreate(sku="VAR-ASSET-MOVE", title="Variant Asset Move Product", brand_name="VOXSTER", status="draft"),
+            VariantCreate(sku="VAR-ASSET-MOVE-1", variant_title="Default Variant"),
+        )
+        first = create_asset_record(session, asset_a, variant_id=variant.id)
+        second = create_asset_record(session, asset_b, variant_id=variant.id)
+        third = create_asset_record(session, asset_c, variant_id=variant.id)
+        session.commit()
+
+        move_asset(session, third.id, "up")
+        session.commit()
+        rows = [row for row in list_assets(session) if row["variant_id"] == variant.id]
+        ordered_ids = [asset["id"] for asset in sorted(rows, key=lambda row: (row["sort_order"], row["id"]))]
+        ordered_sort = [asset["sort_order"] for asset in sorted(rows, key=lambda row: (row["sort_order"], row["id"]))]
+
+    assert ordered_ids == [first.id, third.id, second.id]
+    assert ordered_sort == [0, 1, 2]
 
 
 def test_list_products_includes_primary_photo_asset(tmp_path) -> None:
@@ -3007,12 +3564,12 @@ def test_product_dedupe_dry_run_does_not_change_data(tmp_path) -> None:
 
     assert result["dry_run"] is True
     assert result["groups_count"] >= 1
-    assert unchanged_duplicate.status == "ready"
+    assert unchanged_duplicate.status == "active"
     assert unchanged_duplicate.merged_into_product_id is None
     assert unchanged_master.dedupe_status is None
 
 
-def test_product_dedupe_merges_assets_prices_family_and_archives_duplicate(tmp_path) -> None:
+def test_product_dedupe_merges_assets_prices_and_archives_duplicate(tmp_path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
@@ -3033,7 +3590,7 @@ def test_product_dedupe_merges_assets_prices_family_and_archives_duplicate(tmp_p
         )
         duplicate, duplicate_variant = create_product(
             session,
-            ProductCreate(sku="TINTO-DEDUP", title="TintoLove Blue Shirt", brand_name="TintoLove", status="ready", family_key="TL-BLUE", source_url="https://tintolove.example/blue"),
+            ProductCreate(sku="TINTO-DEDUP", title="TintoLove Blue Shirt", brand_name="TintoLove", status="ready", source_url="https://tintolove.example/blue"),
             VariantCreate(sku="TINTO-DEDUP-BLUE", variant_title="Blue supplier", option_name="Color", option_value="Blue", barcode="7610000000022", cost_price="11.10", cost_currency="EUR"),
         )
         create_asset_record(session, master_image, product_id=master.id)
@@ -3053,7 +3610,6 @@ def test_product_dedupe_merges_assets_prices_family_and_archives_duplicate(tmp_p
     assert duplicate.status == "archived"
     assert duplicate.merged_into_product_id == master.id
     assert master.dedupe_status == "master"
-    assert master.family_key == "TL-BLUE"
     assert master_variant.price == Decimal("29.90")
     assert master_variant.cost_price == Decimal("10.00")
     assert has_purchase_tier
@@ -3095,7 +3651,7 @@ def test_product_duplicate_group_workflow_preview_master_ignore_and_merge(tmp_pa
         )
         duplicate, duplicate_variant = create_product(
             session,
-            ProductCreate(sku="GUI-DUP", title="TintoLove Merge Product", brand_name="TintoLove", status="ready", family_key="TL-MERGE"),
+            ProductCreate(sku="GUI-DUP", title="TintoLove Merge Product", brand_name="TintoLove", status="ready"),
             VariantCreate(sku="GUI-DUP-RED", variant_title="Red", barcode="7610000000999", cost_price="7.50", cost_currency="EUR"),
         )
 
@@ -3124,7 +3680,7 @@ def test_product_duplicate_group_workflow_preview_master_ignore_and_merge(tmp_pa
         )
         duplicate2, _ = create_product(
             session,
-            ProductCreate(sku="GUI-DUP-2", title="TintoLove Merge Product 2", brand_name="TintoLove", status="ready", family_key="TL-MERGE-2"),
+            ProductCreate(sku="GUI-DUP-2", title="TintoLove Merge Product 2", brand_name="TintoLove", status="ready"),
             VariantCreate(sku="GUI-DUP-2-RED", variant_title="Red", barcode="7610000000888", cost_price="9.50", cost_currency="EUR"),
         )
         scan = scan_duplicate_groups(session, min_confidence="HIGH")
@@ -3138,7 +3694,6 @@ def test_product_duplicate_group_workflow_preview_master_ignore_and_merge(tmp_pa
     assert result["status"] == "merged"
     assert duplicate_after.status == "archived"
     assert duplicate_after.merged_into_product_id == master_after.id
-    assert master_after.family_key == "TL-MERGE-2"
     assert master_variant2.price == Decimal("29.90")
     assert master_variant2.cost_price == Decimal("9.50")
 
@@ -3152,19 +3707,31 @@ def test_list_products_hides_archived_by_default_and_can_filter(tmp_path) -> Non
         active, _ = create_product(
             session,
             ProductCreate(sku="ACTIVE-PRODUCT", title="Active Product", status="active"),
-            VariantCreate(sku="ACTIVE-PRODUCT-1", variant_title="Default"),
+            VariantCreate(sku="ACTIVE-PRODUCT-1", variant_title="Default", option_value="500 ml"),
         )
+        _, archived_variant = create_product(
+            session,
+            ProductCreate(sku="ACTIVE-PRODUCT-2", title="Second Active Product", status="active"),
+            VariantCreate(sku="ACTIVE-PRODUCT-2-1", variant_title="Default", option_value="1 l"),
+        )
+        archived_variant.product = active
+        archive_variants(session, [archived_variant.id])
         archived, _ = create_product(
             session,
             ProductCreate(sku="ARCHIVED-PRODUCT", title="Archived Product", status="archived"),
             VariantCreate(sku="ARCHIVED-PRODUCT-1", variant_title="Default"),
         )
+        archived.status = "archived"
+        session.flush()
 
         default_rows = list_products(session)
         archived_rows = list_products(session, archive_filter="archived")
         all_rows = list_products(session, archive_filter="all")
 
     assert active.id in {row["id"] for row in default_rows}
+    active_row = next(row for row in default_rows if row["id"] == active.id)
+    assert active_row["colors"] == "500 ml"
+    assert active_row["variant_count"] == 1
     assert archived.id not in {row["id"] for row in default_rows}
     assert {row["id"] for row in archived_rows} == {archived.id}
     assert {active.id, archived.id}.issubset({row["id"] for row in all_rows})
@@ -3302,6 +3869,37 @@ def test_product_data_enrichment_does_not_overwrite_existing_fields(tmp_path, mo
 
     assert preview["results"][0]["status"] == "no_missing_fields"
     assert preview["results"][0]["suggestions"] == []
+
+
+def test_product_data_enrichment_does_not_overwrite_manual_brand(tmp_path, monkeypatch) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    class FakeResponse:
+        headers = {"content-type": "text/html"}
+        text = "<html><body><p>Neue Beschreibung mit ausreichend Inhalt fuer die Produktdaten-Anreicherung.</p></body></html>"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr(product_data_enrichment_service.requests, "get", lambda *_args, **_kwargs: FakeResponse())
+
+    with SessionLocal() as session:
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="ENRICH-BRAND-1", title="Demo Produkt Brand", status="active", source_language="de-CH", brand_name="Gmöhling"),
+            VariantCreate(sku="ENRICH-BRAND-1.01", variant_title="Default"),
+        )
+        product.source_url_final = "https://voxster.ch/demo-produkt-brand"
+        preview = preview_product_data_enrichment(session, [product.id], fields=["description"], overwrite_existing=True)
+        suggestions = [item for row in preview["results"] for item in row["suggestions"]]
+        apply_product_data_enrichment(session, suggestions, overwrite_existing=True)
+        session.commit()
+        detail = get_product_detail(session, product.id)
+
+    assert detail["brand_name"] == "Gmöhling"
+    assert detail["description"].startswith("Neue Beschreibung")
 
 
 def test_product_update_persists_source_urls_and_enrichment_uses_multiple_sources(tmp_path, monkeypatch) -> None:
@@ -4032,6 +4630,134 @@ def test_source_locale_description_apply_syncs_visible_translation(tmp_path, mon
     assert "Ingredients:" in detail["description"]
     assert "How to use:" in translation["description"]
     assert "Ingredients:" in translation["description"]
+
+
+def test_product_data_enrichment_uses_datasheet_asset_text(tmp_path, monkeypatch) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+    asset_path = tmp_path / "datasheet.pdf"
+    asset_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    def fake_extract_pdf_text(_path):
+        return (
+            "D2 RUST PRODUCT DESCRIPTION: Specific spotting agent for rust and other oxidation stains "
+            "for both dry cleaning and laundry. HOW TO USE: Wet the stain with water and apply a few drops."
+        )
+
+    monkeypatch.setattr(product_data_enrichment_service, "extract_pdf_text", fake_extract_pdf_text)
+
+    with SessionLocal() as session:
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="A15-040XX", title="D2 Rust", status="active", source_language="en"),
+            VariantCreate(sku="A15-040XX-1", variant_title="500 ml"),
+        )
+        asset = create_asset_record(session, asset_path, product_id=product.id, language_code="en")
+        asset.asset_type = "datasheet"
+        preview = preview_product_data_enrichment(
+            session,
+            [product.id],
+            fields=["short_description", "description"],
+            sources=["asset_datasheet"],
+            overwrite_existing=True,
+            target_locale="en",
+        )
+        suggestions = [item for row in preview["results"] for item in row["suggestions"]]
+
+    assert {row["field_name"] for row in suggestions} == {"short_description", "description"}
+    assert all(row["search_method"] == "asset_text_fallback" for row in suggestions)
+    assert any("rust" in row["suggested_value"].lower() for row in suggestions)
+
+
+def test_product_data_enrichment_asset_ai_falls_back_to_title_for_missing_seo_title(tmp_path, monkeypatch) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+    asset_path = tmp_path / "datasheet.pdf"
+    asset_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    monkeypatch.setattr(
+        product_data_enrichment_service,
+        "extract_pdf_text",
+        lambda _path: (
+            "D2 Rust stain remover datasheet. Specific spotting agent for rust and oxidation stains "
+            "for professional dry cleaning and laundry applications. Use only according to the SDS."
+        ),
+    )
+    monkeypatch.setattr(product_data_enrichment_service, "get_translation_config_status", lambda: {"provider": "openai", "enabled": True, "model": "test-model"})
+    monkeypatch.setattr(
+        product_data_enrichment_service,
+        "_call_openai_json",
+        lambda *_args, **_kwargs: {
+            "title": "D2 Rust Stain Remover",
+            "short_description": "",
+            "description": "",
+            "seo_title": "",
+            "seo_description": "",
+            "slug": "",
+            "source_asset_ids": [],
+            "notes": "",
+        },
+    )
+
+    with SessionLocal() as session:
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="A15-040XX", title="D2 Rust", status="active", source_language="en"),
+            VariantCreate(sku="A15-040XX-1", variant_title="500 ml"),
+        )
+        asset = create_asset_record(session, asset_path, product_id=product.id, language_code="en")
+        asset.asset_type = "datasheet"
+        preview = preview_product_data_enrichment(
+            session,
+            [product.id],
+            fields=["seo_title"],
+            sources=["asset_datasheet", "asset_ai"],
+            overwrite_existing=True,
+            target_locale="en",
+        )
+        suggestion = [item for row in preview["results"] for item in row["suggestions"] if item["field_name"] == "seo_title"][0]
+        result = apply_product_data_enrichment(session, [suggestion], overwrite_existing=True)
+        session.commit()
+        detail = get_product_detail(session, product.id)
+        translation = next(row for row in detail["translations"] if row["language_code"] == "en")
+
+    assert suggestion["suggested_value"] == "D2 Rust Stain Remover"
+    assert result["applied_count"] == 1
+    assert translation["seo_title"] == "D2 Rust Stain Remover"
+
+
+def test_product_data_enrichment_text_quality_normalizes_inline_markdown(tmp_path, monkeypatch) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+    asset_path = tmp_path / "datasheet.pdf"
+    asset_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    monkeypatch.setattr(product_data_enrichment_service, "extract_pdf_text", lambda _path: "D2 RUST PRODUCT DESCRIPTION: Specific spotting agent. HOW TO USE: 1. Wet the stain. 2. Apply product.")
+
+    with SessionLocal() as session:
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="A15-040XX", title="D2 Rust", status="active", source_language="en"),
+            VariantCreate(sku="A15-040XX-1", variant_title="500 ml"),
+        )
+        asset = create_asset_record(session, asset_path, product_id=product.id, language_code="en")
+        asset.asset_type = "datasheet"
+        preview = preview_product_data_enrichment(
+            session,
+            [product.id],
+            fields=["description"],
+            sources=["asset_datasheet"],
+            text_quality_options=["markdown", "structure_sections", "clean_supplier_text"],
+            overwrite_existing=True,
+            target_locale="en",
+        )
+        description = [item for row in preview["results"] for item in row["suggestions"]][0]["suggested_value"]
+
+    assert "\n\n### How to use\n\n" in description
+    assert "\n1. Wet the stain." in description
 
 
 def test_product_data_enrichment_slug_candidate_updates_handle_only_on_apply(tmp_path, monkeypatch) -> None:

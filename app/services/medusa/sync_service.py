@@ -19,6 +19,7 @@ from app.db.models import (
     ProductCategoryMapping,
     ProductTranslation,
     ProductVariant,
+    VariantTechnicalAttribute,
     VariantTranslation,
 )
 from app.services.medusa.client import MedusaAdminApiClient, MedusaApiError, MedusaAuthError
@@ -681,13 +682,13 @@ class MedusaSyncService:
             return
         if medusa_product_id and medusa_variant_id and prices:
             try:
-                client.upsert_variant_prices(medusa_product_id, medusa_variant_id, _medusa_variant_prices_payload(prices))
+                response = client.upsert_variant_prices(medusa_product_id, medusa_variant_id, _medusa_variant_prices_payload(prices))
                 mapping = self._get_or_create_mapping(config, "price", variant.id, local_parent_id=variant.id, currency_code=(variant.currency or config.default_currency_code or "CHF").upper())
                 mapping.medusa_parent_id = medusa_variant_id
                 mapping.local_hash = payload_hash
                 mapping.last_synced_at = datetime.now(timezone.utc)
                 mapping.status = "active"
-                self._add_item(run, "price", variant.id, action, "success", medusa_id=medusa_variant_id, request_payload=payload)
+                self._add_item(run, "price", variant.id, action, "success", medusa_id=medusa_variant_id, request_payload=payload, response_payload=response)
             except Exception as exc:
                 self._add_item(run, "price", variant.id, "error", "error", request_payload=payload, error_message=str(exc))
 
@@ -820,6 +821,8 @@ class MedusaSyncService:
                 joinedload(Product.variants).joinedload(ProductVariant.translations),
                 joinedload(Product.variants).joinedload(ProductVariant.assets),
                 joinedload(Product.variants).joinedload(ProductVariant.price_tiers),
+                joinedload(Product.variants).joinedload(ProductVariant.technical_attributes),
+                joinedload(Product.variants).joinedload(ProductVariant.technical_attributes).joinedload(VariantTechnicalAttribute.translations),
             )
             .where(Product.id == product_id)
         )

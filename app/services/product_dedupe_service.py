@@ -410,7 +410,6 @@ def _serialize_product_for_merge(product: Product | None) -> dict[str, Any]:
         "sku": product.sku,
         "status": product.status,
         "brand": product.brand.name if product.brand else "",
-        "family_key": product.family_key or "",
         "variant_count": len(variants),
         "asset_count": len(product.assets or []),
         "sale_price_count": sale_prices,
@@ -449,7 +448,6 @@ def _group_search_text(group: ProductDuplicateGroup) -> str:
     parts = [group.group_key, group.status, group.source, _product_label(group.master_product)]
     for item in group.items:
         parts.append(_product_label(item.product))
-        parts.append(item.product.family_key if item.product else "")
     return " ".join(str(part or "").lower() for part in parts)
 
 
@@ -651,7 +649,6 @@ def _apply_group_merge(session: Session, preview: dict[str, Any], *, created_by:
 
 def _merge_product_fields(master: Product, duplicate: Product, summary: dict[str, list]) -> None:
     fallback_fields = [
-        "family_key",
         "description",
         "source_url",
         "source_url_final",
@@ -809,7 +806,7 @@ def _detect_conflicts(master: Product | None, duplicates: list[Product]) -> list
         return [{"field": "master", "message": "Master fehlt"}]
     conflicts: list[dict[str, Any]] = []
     for duplicate in duplicates:
-        for field in ("title", "description", "family_key"):
+        for field in ("title", "description"):
             master_value = getattr(master, field)
             duplicate_value = getattr(duplicate, field)
             if not _blank(master_value) and not _blank(duplicate_value) and str(master_value).strip() != str(duplicate_value).strip():

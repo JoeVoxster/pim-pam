@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.db.models import Asset, Category, ChannelCategory, MedusaConnectionConfig, Product, ProductTranslation, ProductVariant, ProductVariantPriceTier, VariantTranslation
+from app.services.variant_metadata_service import build_medusa_variant_metadata
 
 
 def stable_hash(payload: Any) -> str:
@@ -104,12 +105,12 @@ class MedusaProductMapper:
         handle = normalize_handle(handle_source)
         thumbnail = image_urls[0] if image_urls else None
         metadata = {
+            "pim_sku": product.sku,
             "pim_product_id": product.id,
             "pim_handle": product.handle,
             "pim_updated_at": product.updated_at.isoformat() if product.updated_at else None,
             "source": "pim-pam",
             "source_language": product.source_language,
-            "family_key": product.family_key,
             "is_chemical": bool(product.is_chemical),
             "pim_category_sort_positions": _category_sort_positions(product),
             "seo_title": translation.seo_title if translation else None,
@@ -142,15 +143,7 @@ class MedusaVariantMapper:
         title = _text(translation.title if translation and translation.title else (variant.variant_title or variant.option_value or variant.packaging or variant.sku))
         option_name = variant_option_name(variant)
         option_value = translation.package_label if translation and translation.package_label else variant_option_value(variant, fallback=title)
-        metadata = {
-            "pim_variant_id": variant.id,
-            "pim_product_id": variant.product_id,
-            "pim_updated_at": variant.updated_at.isoformat() if variant.updated_at else None,
-            "pim_hash": None,
-            "source": "pim-pam",
-            "cost_price": str(variant.cost_price) if variant.cost_price is not None else None,
-            "cost_currency": variant.cost_currency,
-        }
+        metadata = build_medusa_variant_metadata(variant, include_sync_fields=True)
         payload: dict[str, Any] = {
             "title": title,
             "sku": variant.sku,
@@ -282,7 +275,7 @@ class MedusaPricingMapper:
             "amount": money_to_medusa_amount(tier.price),
             "min_quantity": tier.min_qty if tier.min_qty != 1 or tier.max_qty is not None else None,
             "max_quantity": tier.max_qty,
-            "price_list_code": "default",
+            "price_list_code": tier.price_list.code if tier.price_list else "default",
             "metadata": {
                 "pim_price_id": tier.id,
                 "pim_variant_id": variant.id,
@@ -300,6 +293,7 @@ def money_to_medusa_amount(value: Decimal | float | str | int) -> int | float:
 
 def validate_tiered_prices(prices: list[dict[str, Any]]) -> None:
     seen_ranges: dict[tuple[str, str | None], list[tuple[int | None, int | None]]] = {}
+    seen_min_only: dict[tuple[str, str | None], set[int | None]] = {}
     for price in prices:
         amount = int(price["amount"])
         if amount < 0:
@@ -314,7 +308,15 @@ def validate_tiered_prices(prices: list[dict[str, Any]]) -> None:
         if max_qty is not None and min_qty is not None and int(max_qty) < int(min_qty):
             raise ValueError("max_quantity muss >= min_quantity sein.")
         key = (currency, price.get("price_list_code"))
+        if min_qty is not None and max_qty is None:
+            if min_qty in seen_min_only.setdefault(key, set()):
+                raise ValueError("Preisstaffeln dürfen keine doppelte min_quantity innerhalb gleicher Währung/Preisliste haben.")
+            seen_min_only[key].add(min_qty)
+            seen_ranges.setdefault(key, []).append((min_qty, max_qty))
+            continue
         for existing_min, existing_max in seen_ranges.setdefault(key, []):
+            if existing_min is not None and existing_max is None:
+                continue
             if _overlaps(min_qty, max_qty, existing_min, existing_max):
                 raise ValueError("Preisstaffeln überlappen sich innerhalb gleicher Währung/Preisliste.")
         seen_ranges[key].append((min_qty, max_qty))
@@ -355,7 +357,15 @@ def _preferred_assets(assets: list[Asset]) -> list[Asset]:
         key = asset.checksum or asset.object_key or asset.source_url or f"asset:{asset.id}"
         grouped.setdefault(key, []).append(asset)
     preferred = [
-        sorted(group, key=lambda item: (0 if item.storage_provider in {"cloudflare_r2", "bunny_storage"} and item.object_key else 1, item.sort_order, item.id))[0]
+        sorted(group, key=lambda item: (_asset_export_priority(item), item.sort_order, item.id))[0]
         for group in grouped.values()
     ]
     return sorted(preferred, key=lambda item: (item.sort_order, item.id))
+
+
+def _asset_export_priority(asset: Asset) -> int:
+    if asset.storage_provider in {"cloudflare_r2", "bunny_storage"} and asset.object_key:
+        return 0
+    if asset.public_url or str(asset.source_url or "").startswith(("http://", "https://")):
+        return 1
+    return 2

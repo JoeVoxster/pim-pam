@@ -65,7 +65,6 @@ def upgrade() -> None:
         "products",
         sa.column("id", sa.Integer()),
         sa.column("sku", sa.String()),
-        sa.column("family_key", sa.String()),
         sa.column("handle", sa.String()),
         sa.column("source_language", sa.String()),
         sa.column("title", sa.String()),
@@ -131,7 +130,6 @@ def upgrade() -> None:
         bind.execute(
             products_table.insert().values(
                 sku=demo_sku,
-                family_key=None,
                 handle=slugify("Demo Chemieprodukt Natriumhypochlorit 14", separator="-"),
                 source_language="de-CH",
                 title="Demo Chemieprodukt Natriumhypochlorit 14%",

@@ -6,8 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class ProductCreate(BaseModel):
-    sku: str
-    family_key: str | None = None
+    sku: str | None = None
     handle: str | None = None
     source_language: str = "en"
     title: str
@@ -124,10 +123,15 @@ class ProductUpdate(BaseModel):
 
 
 class VariantCreate(BaseModel):
-    sku: str
+    sku: str | None = None
+    manufacturer_sku: str | None = None
+    vendor_description: str | None = None
     variant_title: str | None = None
     option_name: str | None = None
     option_value: str | None = None
+    sales_unit: str | None = None
+    pack_quantity: Decimal | None = None
+    pack_unit: str | None = None
     packaging: str | None = None
     price: Decimal | None = None
     currency: str | None = None
@@ -136,12 +140,43 @@ class VariantCreate(BaseModel):
     stock_qty: int = 0
     barcode: str | None = None
     status: str = "active"
+    customs_description_de: str | None = None
+    customs_description_en: str | None = None
+    origin_country: str | None = None
+    material_composition: str | None = None
+    ch_tariff_code: str | None = None
+    ch_statistical_key: str | None = None
+    ch_customs_unit_code: str | None = None
+    ch_customs_quantity_per_unit: Decimal | None = None
+    ch_net_mass_kg: Decimal | None = None
+    ch_gross_mass_kg: Decimal | None = None
+    ch_preference_possible: bool = False
+    ch_origin_proof_required: bool = False
+    ch_nze_required: bool = False
+    ch_nze_code: str | None = None
+    ch_voc_relevant: bool = False
+    eu_cn_code: str | None = None
+    eu_taric_code: str | None = None
+    de_import_code: str | None = None
+    de_customs_unit_code: str | None = None
+    de_customs_quantity_per_unit: Decimal | None = None
+    eu_export_control_required: bool = False
+    dual_use_required: bool = False
+    reach_relevant: bool = False
+    antidumping_relevant: bool = False
+    customs_notes: str | None = None
 
 
 class VariantUpdate(BaseModel):
+    sku: str | None = None
+    manufacturer_sku: str | None = None
+    vendor_description: str | None = None
     variant_title: str | None = None
     option_name: str | None = None
     option_value: str | None = None
+    sales_unit: str | None = None
+    pack_quantity: Decimal | None = None
+    pack_unit: str | None = None
     packaging: str | None = None
     price: Decimal | None = None
     currency: str | None = None
@@ -150,15 +185,115 @@ class VariantUpdate(BaseModel):
     stock_qty: int = 0
     barcode: str | None = None
     status: str | None = None
+    customs_description_de: str | None = None
+    customs_description_en: str | None = None
+    origin_country: str | None = None
+    material_composition: str | None = None
+    ch_tariff_code: str | None = None
+    ch_statistical_key: str | None = None
+    ch_customs_unit_code: str | None = None
+    ch_customs_quantity_per_unit: Decimal | None = None
+    ch_net_mass_kg: Decimal | None = None
+    ch_gross_mass_kg: Decimal | None = None
+    ch_preference_possible: bool | None = None
+    ch_origin_proof_required: bool | None = None
+    ch_nze_required: bool | None = None
+    ch_nze_code: str | None = None
+    ch_voc_relevant: bool | None = None
+    eu_cn_code: str | None = None
+    eu_taric_code: str | None = None
+    de_import_code: str | None = None
+    de_customs_unit_code: str | None = None
+    de_customs_quantity_per_unit: Decimal | None = None
+    eu_export_control_required: bool | None = None
+    dual_use_required: bool | None = None
+    reach_relevant: bool | None = None
+    antidumping_relevant: bool | None = None
+    customs_notes: str | None = None
+
+
+class VariantCustomsAdditionalCodeUpsert(BaseModel):
+    id: int | None = None
+    variant_id: int
+    jurisdiction: str
+    flow: str
+    code: str
+    description: str | None = None
+    valid_from: str | None = None
+    valid_to: str | None = None
+    status: str = "active"
+    source: str | None = None
+    notes: str | None = None
+
+
+class VariantTechnicalAttributeUpsert(BaseModel):
+    id: int | None = None
+    variant_id: int
+    attribute_code: str | None = None
+    attribute_name: str
+    value_text: str | None = None
+    value_number: Decimal | None = None
+    unit: str | None = None
+    sort_order: int = 0
+
+
+class TechnicalAttributeLabelTranslationUpsert(BaseModel):
+    id: int | None = None
+    attribute_code: str
+    language_code: str
+    label: str
+
+
+class VariantTechnicalAttributeValueTranslationUpsert(BaseModel):
+    id: int | None = None
+    technical_attribute_id: int
+    language_code: str
+    value_text: str
 
 
 class VariantPriceTierCreate(BaseModel):
     variant_id: int
+    price_list_id: int | None = None
     price_type: str = "sale"
     min_qty: int = 1
     max_qty: int | None = None
     price: Decimal
     currency: str
+    status: str = "active"
+
+
+class PriceListUpsert(BaseModel):
+    id: int | None = None
+    code: str
+    name: str
+    price_list_type: str = "sale"
+    sales_channel_id: int | None = None
+    currency: str = "CHF"
+    valid_from: str | None = None
+    valid_to: str | None = None
+    status: str = "active"
+
+
+class CurrencyRateUpsert(BaseModel):
+    id: int | None = None
+    source_currency: str
+    target_currency: str = "CHF"
+    effective_rate: Decimal
+    markup_percent: Decimal = Decimal("0")
+    used_rate: Decimal
+    rate_date: str | None = None
+    status: str = "active"
+
+
+class CostSurchargeUpsert(BaseModel):
+    id: int | None = None
+    code: str
+    name: str
+    surcharge_type: str
+    scope_type: str = "global"
+    scope_value: str | None = None
+    percent: Decimal
+    status: str = "active"
 
 
 class CategoryCreate(BaseModel):

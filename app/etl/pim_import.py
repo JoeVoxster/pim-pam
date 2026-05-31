@@ -227,7 +227,6 @@ def run_pim_import(
                 db_product, db_variant = upsert_product_with_variant(
                     session=session,
                     sku=str(payload["sku"]),
-                    family_key=payload.get("family_key"),
                     source_language=str(payload.get("source_language") or "en"),
                     title=str(payload["title"]),
                     description=payload.get("description"),

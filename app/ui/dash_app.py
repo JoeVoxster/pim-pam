@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import gzip
 import json
 import mimetypes
 import re
@@ -25,22 +26,29 @@ from app.etl.pim_import import load_mapping_config, run_pim_import
 from app.pdf.sdb_renderer import render_sdb_pdf
 from app.schemas.pim import (
     ChannelCategoryUpsert,
+    CostSurchargeUpsert,
+    CurrencyRateUpsert,
     EnrichmentJobOptions,
     ProductCategoryMappingUpsert,
     ProductChannelListingUpdate,
     ProductCreate,
+    PriceListUpsert,
     ProductSDBUpdate,
     ProductTranslationCreate,
     ProductUpdate,
     SalesChannelCreate,
     SalesChannelUpdate,
+    TechnicalAttributeLabelTranslationUpsert,
     VariantChannelListingUpdate,
     VariantCreate,
+    VariantCustomsAdditionalCodeUpsert,
     VariantPriceTierCreate,
+    VariantTechnicalAttributeUpsert,
+    VariantTechnicalAttributeValueTranslationUpsert,
     VariantTranslationCreate,
     VariantUpdate,
 )
-from app.services.asset_service import create_asset_record, upload_r2_asset_from_bytes, upload_selected_assets_to_r2
+from app.services.asset_service import create_asset_record, update_asset_metadata, upload_r2_asset_from_bytes, upload_selected_assets_to_r2
 from app.services.chemical_enrichment_service import (
     apply_product_chemical_enrichment,
     apply_product_chemical_enrichment_suggestions,
@@ -168,8 +176,12 @@ from app.services.pim_service import (
     create_product,
     dashboard_counts,
     delete_asset,
+    delete_variant_technical_attribute,
+    delete_variant_customs_additional_code,
     delete_or_archive_variants,
     delete_category,
+    hard_delete_product,
+    hard_delete_variants,
     get_category_detail,
     get_products_for_category,
     get_product_category_assignment_for_channel,
@@ -179,23 +191,34 @@ from app.services.pim_service import (
     list_attribute_overview,
     list_brands,
     list_categories,
+    list_cost_surcharges,
+    list_currency_rates,
     list_product_category_assignments,
-    list_family_overview,
+    list_price_lists,
     list_import_jobs,
     list_products,
     list_rule_overview,
     list_sales_channels,
+    list_technical_attribute_label_translations,
     list_translation_overview,
+    list_variant_technical_attribute_value_translations,
     list_variant_translation_overview,
     get_products_for_channel_category,
     move_products_to_category,
     upsert_channel_category,
     upsert_product_category_mapping,
     upsert_product_channel_listing,
+    upsert_technical_attribute_label_translation,
     upsert_variant_channel_listing,
+    upsert_variant_customs_additional_code,
+    upsert_variant_technical_attribute,
+    upsert_variant_technical_attribute_value_translation,
     list_variants,
     move_asset,
     get_product_sdb,
+    upsert_cost_surcharge,
+    upsert_currency_rate,
+    upsert_price_list,
     upsert_variant_price_tier,
     delete_variant_price_tier,
     upsert_product_sdb,
@@ -285,12 +308,31 @@ def _run_pim_import_background(
         _set_pim_import_run(job_id, status="failed", finished_at=datetime.now(timezone.utc).isoformat(), error=str(exc))
 
 
+PRODUCT_STATUS_VALUES = ["draft", "active", "inactive"]
+VARIANT_STATUS_VALUES = ["draft", "active", "inactive"]
+CHANNEL_PUBLICATION_STATUS_VALUES = ["imported", "draft", "ready", "published", "inactive", "archived"]
+
+
 PRODUCT_COLUMNS = [
     {"field": "id", "maxWidth": 90},
     {"field": "variant_nav", "headerName": "V", "maxWidth": 55, "editable": False, "filter": False, "sortable": False},
-    {"field": "sku"},
-    {"field": "title", "flex": 1.8, "minWidth": 280, "editable": True, "cellRenderer": "ProductTitleButton"},
-    {"field": "photo_asset_id", "headerName": "Photo", "maxWidth": 90, "editable": False, "filter": False, "sortable": False, "cellRenderer": "ProductPhotoCell"},
+    {"field": "sku", "headerName": "Produkt-SKU / Artikelfamilie", "editable": True, "minWidth": 135, "maxWidth": 170},
+    {"field": "title", "flex": 1.8, "minWidth": 280, "editable": True},
+    {
+        "field": "photo_filter",
+        "headerName": "Photo",
+        "minWidth": 105,
+        "maxWidth": 120,
+        "editable": False,
+        "sortable": False,
+        "cellRenderer": "ProductPhotoCell",
+        "filter": "agTextColumnFilter",
+        "headerComponent": "ProductSelectFilterHeader",
+        "headerComponentParams": {
+            "values": ["mit Photo", "ohne Photo"],
+            "allLabel": "Alle",
+        },
+    },
     {
         "field": "source_language",
         "headerName": "Sprache",
@@ -299,37 +341,73 @@ PRODUCT_COLUMNS = [
         "cellEditor": "agSelectCellEditor",
         "cellEditorParams": {"values": ["en", "de-CH", "it", "fr", "de"]},
     },
-    {"field": "family_key", "headerName": "Family Key"},
-    {"field": "colors", "headerName": "Variantenwerte", "flex": 1.4, "minWidth": 220},
-    {"field": "brand", "editable": True},
-    {"field": "status", "editable": True},
-    {"field": "price_from", "headerName": "Ab-Preis"},
-    {"field": "price", "headerName": "Normalpreis"},
-    {"field": "cost_price", "headerName": "EK"},
-    {"field": "margin_percent"},
-    {"field": "currency", "maxWidth": 110},
-    {"field": "updated_at", "flex": 1},
+    {"field": "colors", "headerName": "Variantenwerte", "minWidth": 130, "maxWidth": 170},
+    {"field": "brand", "editable": True, "cellDataType": "text", "minWidth": 105, "maxWidth": 135},
+    {
+        "field": "status",
+        "editable": True,
+        "minWidth": 115,
+        "maxWidth": 135,
+        "cellEditor": "agSelectCellEditor",
+        "cellEditorParams": {"values": PRODUCT_STATUS_VALUES},
+        "filter": "agTextColumnFilter",
+        "headerComponent": "ProductSelectFilterHeader",
+        "headerComponentParams": {
+            "values": PRODUCT_STATUS_VALUES,
+            "allLabel": "Alle",
+        },
+    },
+    {"field": "updated_at", "headerName": "Updated at", "flex": 1.2, "minWidth": 190},
 ]
 VARIANT_COLUMNS = [
     {"field": "id", "maxWidth": 90},
-    {"field": "product_title", "flex": 1.6, "minWidth": 280},
-    {"field": "sku"},
+    {"field": "product_nav", "headerName": "P", "maxWidth": 55, "editable": False, "filter": False, "sortable": False},
+    {"field": "sku", "headerName": "Varianten-SKU", "editable": True, "minWidth": 120, "maxWidth": 150},
+    {"field": "manufacturer_sku", "headerName": "Vendor-SKU", "editable": True},
+    {"field": "vendor_description", "headerName": "Vendor-Beschr.", "editable": True, "minWidth": 120, "maxWidth": 155},
     {"field": "variant_title", "flex": 1.8, "minWidth": 320, "editable": True},
-    {"field": "option_name", "headerName": "Attribut", "editable": True},
-    {"field": "option_value", "headerName": "Wert", "editable": True},
-    {"field": "packaging", "editable": True},
-    {"field": "price", "editable": True},
-    {"field": "cost_price", "editable": True},
-    {"field": "margin_percent"},
-    {"field": "currency", "maxWidth": 110, "editable": True},
-    {"field": "stock_qty", "editable": True},
+    {"field": "option_name", "headerName": "Attribut", "editable": True, "minWidth": 90, "maxWidth": 120},
+    {"field": "option_value", "headerName": "Wert", "editable": True, "minWidth": 72, "maxWidth": 92},
+    {"field": "sales_unit", "headerName": "Verkaufseinheit", "editable": True, "minWidth": 118, "maxWidth": 140},
+    {"field": "pack_quantity", "headerName": "Packmenge", "editable": True, "minWidth": 104, "maxWidth": 122},
+    {"field": "pack_unit", "headerName": "Packeinheit", "editable": True, "minWidth": 108, "maxWidth": 128},
+    {"field": "packaging", "headerName": "Packaging", "editable": True, "width": 260, "minWidth": 230, "maxWidth": 320, "tooltipField": "packaging"},
+    {"field": "price", "editable": True, "minWidth": 68, "maxWidth": 84},
+    {"field": "cost_price", "editable": True, "minWidth": 74, "maxWidth": 90},
+    {"field": "margin_amount", "headerName": "Marge absolut", "minWidth": 92, "maxWidth": 108},
+    {"field": "margin_percent", "minWidth": 80, "maxWidth": 96},
+    {"field": "currency", "editable": True, "minWidth": 68, "maxWidth": 82},
+    {"field": "stock_qty", "editable": True, "minWidth": 72, "maxWidth": 88},
     {"field": "barcode", "editable": True},
     {
         "field": "status",
         "editable": True,
+        "minWidth": 90,
+        "maxWidth": 115,
         "cellEditor": "agSelectCellEditor",
-        "cellEditorParams": {"values": ["active", "inactive", "archived"]},
+        "cellEditorParams": {"values": VARIANT_STATUS_VALUES},
     },
+]
+VARIANT_CUSTOMS_CODE_COLUMNS = [
+    {"field": "id", "maxWidth": 80},
+    {"field": "jurisdiction", "headerName": "Jurisdiktion", "editable": True, "maxWidth": 130},
+    {"field": "flow", "headerName": "Flow", "editable": True, "maxWidth": 110},
+    {"field": "code", "headerName": "Code", "editable": True, "maxWidth": 120},
+    {"field": "description", "headerName": "Beschreibung", "editable": True, "flex": 1, "minWidth": 220},
+    {"field": "valid_from", "headerName": "Gültig von", "editable": True, "minWidth": 135},
+    {"field": "valid_to", "headerName": "Gültig bis", "editable": True, "minWidth": 135},
+    {"field": "status", "headerName": "Status", "editable": True, "maxWidth": 120},
+    {"field": "source", "headerName": "Quelle", "editable": True, "minWidth": 140},
+    {"field": "delete_action", "headerName": "Löschen", "maxWidth": 100, "editable": False, "sortable": False, "filter": False},
+]
+VARIANT_TECHNICAL_ATTRIBUTE_COLUMNS = [
+    {"field": "id", "maxWidth": 80},
+    {"field": "attribute_name", "headerName": "Attribut", "editable": True, "minWidth": 150, "flex": 1},
+    {"field": "value_text", "headerName": "Wert Text", "editable": True, "minWidth": 130, "flex": 1},
+    {"field": "value_number", "headerName": "Wert Zahl", "editable": True, "maxWidth": 120},
+    {"field": "unit", "headerName": "Einheit", "editable": True, "maxWidth": 100},
+    {"field": "sort_order", "headerName": "Sort.", "editable": True, "maxWidth": 90},
+    {"field": "delete_action", "headerName": "Löschen", "maxWidth": 100, "editable": False, "sortable": False, "filter": False},
 ]
 DEDUPLICATE_GROUP_COLUMNS = [
     {"field": "id", "headerName": "Gruppe-ID", "maxWidth": 110},
@@ -347,10 +425,9 @@ DEDUPLICATE_ITEM_COLUMNS = [
     {"field": "product_id", "headerName": "Produkt-ID", "maxWidth": 120, "checkboxSelection": True, "headerCheckboxSelection": True},
     {"field": "role", "headerName": "Rolle", "maxWidth": 110},
     {"field": "title", "headerName": "Titel", "flex": 1.5, "minWidth": 260},
-    {"field": "sku", "headerName": "SKU", "minWidth": 150},
+    {"field": "sku", "headerName": "Produkt-SKU", "minWidth": 150},
     {"field": "status", "maxWidth": 110},
     {"field": "brand", "headerName": "Marke", "minWidth": 140},
-    {"field": "family_key", "headerName": "Family Key", "minWidth": 140},
     {"field": "variant_count", "headerName": "Varianten", "maxWidth": 115},
     {"field": "asset_count", "headerName": "Assets", "maxWidth": 100},
     {"field": "sale_price_count", "headerName": "VK", "maxWidth": 80},
@@ -372,9 +449,19 @@ PRODUCT_ENRICHMENT_SUGGESTION_COLUMNS = [
     {"field": "sku", "headerName": "SKU", "minWidth": 140},
     {"field": "title", "headerName": "Produkt", "flex": 1, "minWidth": 220},
     {"field": "field_name", "headerName": "Feld", "minWidth": 150},
-    {"field": "current_value", "headerName": "Aktueller Wert", "flex": 1, "minWidth": 220},
-    {"field": "original_value", "headerName": "Original", "flex": 1.2, "minWidth": 280},
-    {"field": "suggested_value", "headerName": "Vorschlag", "flex": 1.5, "minWidth": 320},
+    {"field": "current_value", "headerName": "Aktueller Wert", "flex": 1, "minWidth": 220, "tooltipField": "current_value"},
+    {"field": "original_value", "headerName": "Quelle / Ausgangstext", "flex": 1.2, "minWidth": 280, "tooltipField": "original_value"},
+    {
+        "field": "suggested_value",
+        "headerName": "Vorschlag",
+        "flex": 1.5,
+        "minWidth": 320,
+        "editable": True,
+        "tooltipField": "suggested_value",
+        "cellEditor": "agLargeTextCellEditor",
+        "cellEditorPopup": True,
+        "cellEditorParams": {"maxLength": 20000, "rows": 18, "cols": 80},
+    },
     {"field": "source_language", "headerName": "Quelle Sprache", "minWidth": 130},
     {"field": "target_locale", "headerName": "Ziel", "maxWidth": 110},
     {"field": "section_name", "headerName": "Sektion", "minWidth": 140},
@@ -540,14 +627,28 @@ SDB_TRANSLATION_PROMPT_COLUMNS = [
 ]
 ASSET_COLUMNS = [
     {"field": "asset_preview", "headerName": "Vorschau", "maxWidth": 120, "editable": False, "filter": False, "sortable": False, "cellRenderer": "AssetPreviewCell"},
-    {"field": "id", "maxWidth": 90},
-    {"field": "title", "headerName": "Titel", "minWidth": 160},
+    {"field": "id", "maxWidth": 90, "editable": False},
+    {"field": "title", "headerName": "Titel", "minWidth": 160, "editable": True},
     {"field": "original_filename", "headerName": "Original-Datei", "minWidth": 180},
-    {"field": "asset_type", "headerName": "Asset-Typ", "minWidth": 150},
+    {
+        "field": "asset_type",
+        "headerName": "Asset-Typ",
+        "minWidth": 150,
+        "editable": True,
+        "cellEditor": "agSelectCellEditor",
+        "cellEditorParams": {"values": ["product_image", "product_gallery", "safety_data_sheet", "technical_data_sheet", "manual", "invoice_pdf", "import_file", "other"]},
+    },
     {"field": "product_id", "headerName": "Product_ID", "maxWidth": 110, "cellRenderer": "ProductIdLinkCell"},
     {"field": "product_sku", "headerName": "Artikel", "maxWidth": 140},
     {"field": "product_title", "headerName": "Produkt", "flex": 1},
-    {"field": "language_code", "headerName": "Sprache", "maxWidth": 110},
+    {
+        "field": "language_code",
+        "headerName": "Sprache",
+        "maxWidth": 120,
+        "editable": True,
+        "cellEditor": "agSelectCellEditor",
+        "cellEditorParams": {"values": ["", "de-CH", "de", "en", "fr", "it", "es", "unknown"]},
+    },
     {"field": "variant_id", "headerName": "Variant_ID", "maxWidth": 110, "cellRenderer": "VariantIdLinkCell"},
     {"field": "variant_sku", "headerName": "Variante", "maxWidth": 140},
     {"field": "filename", "flex": 1},
@@ -556,10 +657,10 @@ ASSET_COLUMNS = [
     {"field": "storage_provider", "headerName": "Storage", "minWidth": 150},
     {"field": "bucket", "headerName": "Bucket", "minWidth": 150},
     {"field": "object_key", "headerName": "Object Key", "flex": 1},
-    {"field": "status", "headerName": "Status", "maxWidth": 120},
+    {"field": "status", "headerName": "Status", "maxWidth": 120, "editable": True},
     {"field": "uploaded_at", "headerName": "Hochgeladen", "minWidth": 160},
     {"field": "sdb_document_type", "headerName": "Dok.typ", "maxWidth": 110},
-    {"field": "sdb_language_code", "headerName": "SDB Sprache", "maxWidth": 130},
+    {"field": "sdb_language_code", "headerName": "SDB-Dok. Sprache", "maxWidth": 140},
     {"field": "sdb_generated_at_display", "headerName": "Generiert am", "minWidth": 155},
     {"field": "sdb_status", "headerName": "SDB Status", "minWidth": 130},
     {"field": "sdb_source", "headerName": "SDB Quelle", "minWidth": 130},
@@ -591,17 +692,6 @@ ATTRIBUTE_COLUMNS = [
     {"field": "value_count", "headerName": "Werte", "maxWidth": 120},
     {"field": "example_values", "headerName": "Beispielwerte", "flex": 1, "minWidth": 280},
 ]
-FAMILY_COLUMNS = [
-    {"field": "id", "maxWidth": 90},
-    {"field": "family_key", "headerName": "Family Key", "minWidth": 160},
-    {"field": "sku", "minWidth": 140},
-    {"field": "title", "flex": 1.4, "minWidth": 260},
-    {"field": "brand"},
-    {"field": "variant_count", "headerName": "Varianten", "maxWidth": 120},
-    {"field": "attributes", "headerName": "Attribute", "minWidth": 160},
-    {"field": "values", "headerName": "Werte", "flex": 1, "minWidth": 220},
-    {"field": "updated_at", "minWidth": 180},
-]
 TRANSLATION_COLUMNS = [
     {"field": "id", "maxWidth": 90},
     {"field": "product_sku", "headerName": "Artikel", "minWidth": 140},
@@ -629,6 +719,22 @@ VARIANT_TRANSLATION_COLUMNS = [
     {"field": "title", "headerName": "Titel", "flex": 1, "minWidth": 220},
     {"field": "option_label_override", "headerName": "Optionslabel", "flex": 1, "minWidth": 180},
     {"field": "package_label", "headerName": "Gebindelabel", "flex": 1, "minWidth": 180},
+]
+TECHNICAL_ATTRIBUTE_LABEL_TRANSLATION_COLUMNS = [
+    {"field": "id", "maxWidth": 80},
+    {"field": "attribute_code", "headerName": "Code", "minWidth": 150},
+    {"field": "language_code", "headerName": "Sprache", "maxWidth": 110},
+    {"field": "label", "headerName": "Label", "flex": 1, "minWidth": 220},
+]
+TECHNICAL_ATTRIBUTE_VALUE_TRANSLATION_COLUMNS = [
+    {"field": "id", "maxWidth": 80},
+    {"field": "product_sku", "headerName": "Artikel", "minWidth": 130},
+    {"field": "variant_sku", "headerName": "Variante", "minWidth": 150},
+    {"field": "attribute_name", "headerName": "Attribut", "minWidth": 160},
+    {"field": "original_value", "headerName": "Originalwert", "minWidth": 150},
+    {"field": "unit", "headerName": "Einheit", "maxWidth": 95},
+    {"field": "language_code", "headerName": "Sprache", "maxWidth": 110},
+    {"field": "value_text", "headerName": "Übersetzter Wert", "flex": 1, "minWidth": 220},
 ]
 SALES_CHANNEL_COLUMNS = [
     {"field": "id", "maxWidth": 90},
@@ -674,7 +780,7 @@ PRODUCT_CHANNEL_LISTING_COLUMNS = [
         "minWidth": 130,
         "editable": True,
         "cellEditor": "agSelectCellEditor",
-        "cellEditorParams": {"values": ["imported", "draft", "ready", "published", "inactive", "archived"]},
+        "cellEditorParams": {"values": CHANNEL_PUBLICATION_STATUS_VALUES},
     },
     {"field": "active_from", "headerName": "Aktiv ab", "minWidth": 180, "editable": True},
     {"field": "active_until", "headerName": "Aktiv bis", "minWidth": 180, "editable": True},
@@ -708,7 +814,7 @@ VARIANT_CHANNEL_LISTING_COLUMNS = [
         "minWidth": 130,
         "editable": True,
         "cellEditor": "agSelectCellEditor",
-        "cellEditorParams": {"values": ["imported", "draft", "ready", "published", "inactive", "archived"]},
+        "cellEditorParams": {"values": CHANNEL_PUBLICATION_STATUS_VALUES},
     },
     {"field": "price_enabled", "headerName": "Preis", "maxWidth": 90, "editable": True},
     {"field": "shippable", "headerName": "Versand", "maxWidth": 100, "editable": True},
@@ -725,45 +831,60 @@ RULE_COLUMNS = [
 ]
 DETAIL_VARIANT_COLUMNS = [
     {"field": "id", "maxWidth": 90},
-    {"field": "sku"},
+    {"field": "sku", "headerName": "Varianten-SKU"},
+    {"field": "manufacturer_sku", "headerName": "Vendor-SKU"},
+    {"field": "vendor_description", "headerName": "Vendor-Beschr.", "minWidth": 120, "maxWidth": 155},
     {"field": "medusa_id", "headerName": "Medusa Variant ID", "minWidth": 190},
     {"field": "medusa_mapping_status", "headerName": "Medusa Status", "minWidth": 140},
     {"field": "medusa_last_synced_at", "headerName": "Letzter Medusa Sync", "minWidth": 190},
     {"field": "variant_title", "flex": 1.8, "minWidth": 320},
     {"field": "option_name", "headerName": "Attribut"},
-    {"field": "option_value", "headerName": "Wert"},
-    {"field": "packaging"},
-    {"field": "price"},
-    {"field": "cost_price"},
-    {"field": "margin_percent"},
-    {"field": "currency", "maxWidth": 110},
-    {"field": "stock_qty"},
+    {"field": "option_value", "headerName": "Wert", "minWidth": 72, "maxWidth": 92},
+    {"field": "sales_unit", "headerName": "Verkaufseinheit", "minWidth": 118, "maxWidth": 140},
+    {"field": "pack_quantity", "headerName": "Packmenge", "minWidth": 104, "maxWidth": 122},
+    {"field": "pack_unit", "headerName": "Packeinheit", "minWidth": 108, "maxWidth": 128},
+    {"field": "packaging", "headerName": "Packaging", "width": 300, "minWidth": 260, "maxWidth": 360, "tooltipField": "packaging"},
+    {"field": "price", "minWidth": 68, "maxWidth": 84},
+    {"field": "cost_price", "minWidth": 74, "maxWidth": 90},
+    {"field": "margin_amount", "headerName": "Marge absolut", "minWidth": 92, "maxWidth": 108},
+    {"field": "margin_percent", "minWidth": 80, "maxWidth": 96},
+    {"field": "currency", "minWidth": 68, "maxWidth": 82},
+    {"field": "stock_qty", "minWidth": 72, "maxWidth": 88},
     {"field": "status", "headerName": "Status", "maxWidth": 120},
 ]
 DETAIL_TIER_COLUMNS = [
     {"field": "id", "maxWidth": 90},
+    {"field": "price_list_code", "headerName": "Preisliste", "minWidth": 110, "maxWidth": 135},
+    {"field": "sales_channel_name", "headerName": "Kanal", "minWidth": 100, "maxWidth": 125},
     {
         "field": "price_type",
         "headerName": "Typ",
         "editable": True,
-        "minWidth": 120,
-        "maxWidth": 140,
+        "minWidth": 86,
+        "maxWidth": 104,
         "cellStyle": {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"},
         "cellEditor": "agSelectCellEditor",
-        "cellEditorParams": {"values": ["sale", "purchase"]},
+        "cellEditorParams": {"values": ["sale", "purchase", "special", "override"]},
     },
-    {"field": "min_qty", "headerName": "Min.", "editable": True, "minWidth": 96, "maxWidth": 110, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
-    {"field": "max_qty", "headerName": "Max.", "editable": True, "minWidth": 96, "maxWidth": 110, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
-    {"field": "price", "headerName": "Preis", "editable": True, "minWidth": 120, "maxWidth": 140, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
-    {"field": "margin_amount", "headerName": "Marge", "minWidth": 126, "maxWidth": 150, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
-    {"field": "total_margin_amount", "headerName": "Gesamtmarge", "minWidth": 150, "maxWidth": 176, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
-    {"field": "margin_percent", "headerName": "Marge %", "minWidth": 120, "maxWidth": 136, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
+    {"field": "min_qty", "headerName": "Min.", "editable": True, "minWidth": 68, "maxWidth": 82, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
+    {"field": "max_qty", "headerName": "Max.", "editable": True, "minWidth": 68, "maxWidth": 82, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
+    {"field": "price", "headerName": "Preis", "editable": True, "minWidth": 88, "maxWidth": 106, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
+    {"field": "calc_cost", "headerName": "EK kalk.", "minWidth": 88, "maxWidth": 106, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
+    {"field": "calc_fx_rate", "headerName": "Kurs", "minWidth": 74, "maxWidth": 88, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
+    {"field": "calc_surcharges", "headerName": "Zuschläge", "minWidth": 150, "maxWidth": 190},
+    {"field": "calc_margin_amount", "headerName": "DB", "minWidth": 82, "maxWidth": 96, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
+    {"field": "calc_margin_percent", "headerName": "DB%", "minWidth": 82, "maxWidth": 96, "cellRenderer": "PercentCell", "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
+    {"field": "calc_total_margin_amount", "headerName": "DB Tot.", "minWidth": 88, "maxWidth": 104, "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"}},
+    {"field": "calc_warning", "headerName": "Kalk. Hinweis", "minWidth": 125, "maxWidth": 155, "cellStyle": {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"}},
+    {"field": "valid_from", "headerName": "Gültig von", "minWidth": 112, "maxWidth": 132},
+    {"field": "valid_to", "headerName": "Gültig bis", "minWidth": 112, "maxWidth": 132},
+    {"field": "status", "headerName": "Status", "editable": True, "minWidth": 86, "maxWidth": 104, "cellEditor": "agSelectCellEditor", "cellEditorParams": {"values": ["active", "inactive", "archived"]}},
     {
         "field": "currency",
         "headerName": "Währung",
         "editable": True,
-        "minWidth": 96,
-        "maxWidth": 110,
+        "minWidth": 76,
+        "maxWidth": 90,
         "cellStyle": {"textAlign": "right", "whiteSpace": "nowrap", "fontVariantNumeric": "tabular-nums"},
         "cellEditor": "agSelectCellEditor",
         "cellEditorParams": {"values": ["EUR", "CHF", "USD"]},
@@ -771,28 +892,80 @@ DETAIL_TIER_COLUMNS = [
     {
         "field": "delete_action",
         "headerName": "Löschen",
-        "maxWidth": 108,
+        "minWidth": 78,
+        "maxWidth": 92,
         "editable": False,
         "sortable": False,
         "filter": False,
         "cellStyle": {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"},
     },
 ]
+PRICE_LIST_COLUMNS = [
+    {"field": "id", "maxWidth": 90},
+    {"field": "code", "headerName": "Code", "minWidth": 160},
+    {"field": "name", "headerName": "Name", "flex": 1, "minWidth": 220},
+    {"field": "price_list_type", "headerName": "Typ", "maxWidth": 140},
+    {"field": "sales_channel_name", "headerName": "Kanal", "minWidth": 150},
+    {"field": "currency", "headerName": "Währung", "maxWidth": 110},
+    {"field": "valid_from", "headerName": "Gültig von", "minWidth": 155},
+    {"field": "valid_to", "headerName": "Gültig bis", "minWidth": 155},
+    {"field": "status", "headerName": "Status", "maxWidth": 120},
+]
+CURRENCY_RATE_COLUMNS = [
+    {"field": "id", "maxWidth": 90},
+    {"field": "source_currency", "headerName": "Von", "maxWidth": 90},
+    {"field": "target_currency", "headerName": "Nach", "maxWidth": 90},
+    {"field": "effective_rate", "headerName": "Effektiver Kurs", "minWidth": 140},
+    {"field": "markup_percent", "headerName": "Aufschlag %", "minWidth": 120},
+    {"field": "calculated_rate", "headerName": "Kalk. Kurs", "minWidth": 130},
+    {"field": "used_rate", "headerName": "Verwendeter Kurs", "minWidth": 150},
+    {"field": "rate_date", "headerName": "Kursdatum", "minWidth": 150},
+    {"field": "status", "headerName": "Status", "maxWidth": 120},
+]
+COST_SURCHARGE_COLUMNS = [
+    {"field": "id", "maxWidth": 90},
+    {"field": "code", "headerName": "Code", "minWidth": 150},
+    {"field": "name", "headerName": "Name", "flex": 1, "minWidth": 220},
+    {"field": "surcharge_type", "headerName": "Typ", "minWidth": 140},
+    {"field": "scope_type", "headerName": "Gültigkeit", "minWidth": 130},
+    {"field": "scope_value", "headerName": "Wert", "minWidth": 150},
+    {"field": "percent", "headerName": "%", "maxWidth": 100},
+    {"field": "factor", "headerName": "Faktor", "maxWidth": 110},
+    {"field": "status", "headerName": "Status", "maxWidth": 120},
+]
 DETAIL_ASSET_COLUMNS = [
     {"field": "asset_preview", "headerName": "Vorschau", "maxWidth": 120, "editable": False, "filter": False, "sortable": False, "cellRenderer": "AssetPreviewCell"},
-    {"field": "id", "maxWidth": 90},
+    {"field": "id", "maxWidth": 90, "editable": False},
     {"field": "sort_order", "headerName": "#", "maxWidth": 80},
+    {"field": "title", "headerName": "Titel", "minWidth": 160, "editable": True},
+    {
+        "field": "asset_type",
+        "headerName": "Asset-Typ",
+        "minWidth": 150,
+        "editable": True,
+        "cellEditor": "agSelectCellEditor",
+        "cellEditorParams": {"values": ["product_image", "product_gallery", "safety_data_sheet", "technical_data_sheet", "manual", "invoice_pdf", "import_file", "other"]},
+    },
+    {
+        "field": "language_code",
+        "headerName": "Sprache",
+        "maxWidth": 120,
+        "editable": True,
+        "cellEditor": "agSelectCellEditor",
+        "cellEditorParams": {"values": ["", "de-CH", "de", "en", "fr", "it", "es", "unknown"]},
+    },
     {"field": "product_sku", "headerName": "Artikel", "maxWidth": 140},
     {"field": "variant_sku", "headerName": "Variante", "maxWidth": 140},
     {"field": "filename", "flex": 1},
     {"field": "mime_type"},
     {"field": "sdb_document_type", "headerName": "Dok.typ", "maxWidth": 110},
-    {"field": "sdb_language_code", "headerName": "SDB Sprache", "maxWidth": 130},
+    {"field": "sdb_language_code", "headerName": "SDB-Dok. Sprache", "maxWidth": 140},
     {"field": "sdb_generated_at_display", "headerName": "Generiert am", "minWidth": 155},
     {"field": "sdb_status", "headerName": "SDB Status", "minWidth": 130},
     {"field": "sdb_source", "headerName": "SDB Quelle", "minWidth": 130},
     {"field": "source_url", "flex": 1},
     {"field": "storage_path", "flex": 1},
+    {"field": "status", "headerName": "Status", "maxWidth": 120, "editable": True},
 ]
 DETAIL_TRANSLATION_COLUMNS = [
     {"field": "id", "maxWidth": 90},
@@ -825,15 +998,10 @@ BOOLEAN_OPTIONS = [
     {"label": "Ja", "value": True},
     {"label": "Nein", "value": False},
 ]
-PUBLICATION_STATUS_OPTIONS = [
-    {"label": "imported", "value": "imported"},
-    {"label": "draft", "value": "draft"},
-    {"label": "ready", "value": "ready"},
-    {"label": "published", "value": "published"},
-    {"label": "inactive", "value": "inactive"},
-    {"label": "archived", "value": "archived"},
-]
-PRODUCT_BULK_STATUS_OPTIONS = [{"label": value, "value": value} for value in ["active", "imported", "draft", "ready", "published", "inactive", "archived"]]
+PRODUCT_STATUS_OPTIONS = [{"label": value, "value": value} for value in PRODUCT_STATUS_VALUES]
+VARIANT_STATUS_OPTIONS = [{"label": value, "value": value} for value in VARIANT_STATUS_VALUES]
+PUBLICATION_STATUS_OPTIONS = [{"label": value, "value": value} for value in CHANNEL_PUBLICATION_STATUS_VALUES]
+PRODUCT_BULK_STATUS_OPTIONS = [{"label": value, "value": value} for value in PRODUCT_STATUS_VALUES]
 SIGNAL_WORD_OPTIONS = [
     {"label": "Kein Signalwort", "value": "none"},
     {"label": "ACHTUNG / warning", "value": "warning"},
@@ -879,6 +1047,28 @@ def _with_session(callback):
 
     wrapper.__name__ = callback.__name__
     return wrapper
+
+
+def enable_response_compression(server) -> None:
+    @server.after_request
+    def _gzip_response(response):
+        accepted = request.headers.get("Accept-Encoding", "")
+        if "gzip" not in accepted.lower():
+            return response
+        if response.direct_passthrough or response.status_code < 200 or response.status_code >= 300:
+            return response
+        if response.headers.get("Content-Encoding"):
+            return response
+        if response.mimetype not in {"application/json", "application/javascript", "text/css", "text/html"}:
+            return response
+        data = response.get_data()
+        if len(data) < 1024:
+            return response
+        response.set_data(gzip.compress(data, compresslevel=5))
+        response.headers["Content-Encoding"] = "gzip"
+        response.headers["Content-Length"] = str(len(response.get_data()))
+        response.headers["Vary"] = "Accept-Encoding"
+        return response
 
 
 def import_upload_root() -> Path:
@@ -975,30 +1165,42 @@ def _suva_import_protocol_message(suva_report: dict | None) -> str:
     )
 
 
-def app_snapshot(session: Session, product_archive_filter: str = "active", variant_archive_filter: str = "active") -> dict:
+def app_snapshot(
+    session: Session,
+    active_tab: str | None = "dashboard",
+) -> dict:
     ensure_default_sales_channels(session)
+    active = active_tab or "dashboard"
     counts = dashboard_counts(session)
     brands = list_brands(session)
     categories = list_categories(session, sales_channel_code="*")
     sales_channels = list_sales_channels(session)
     channel_categories = list_channel_categories(session)
+    price_lists = list_price_lists(session) if active == "variants" else []
+    load_jobs = active in {"dashboard", "jobs"}
     return {
         "counts": counts,
-        "products": list_products(session, archive_filter=product_archive_filter),
-        "chemistry_products": list_chemical_products(session),
-        "variants": list_variants(session, archive_filter=variant_archive_filter),
+        "products": list_products(session) if active == "products" else [],
+        "chemistry_products": list_chemical_products(session) if active == "chemistry" else [],
+        "variants": list_variants(session) if active == "variants" else [],
         "categories": categories,
-        "assets": list_assets(session),
-        "jobs": list_import_jobs(session),
-        "attributes": list_attribute_overview(session),
-        "families": list_family_overview(session),
-        "translations": list_translation_overview(session),
-        "variant_translations": list_variant_translation_overview(session),
+        "assets": list_assets(session) if active == "assets" else [],
+        "jobs": list_import_jobs(session) if load_jobs else [],
+        "attributes": list_attribute_overview(session) if active == "attributes" else [],
+        "families": [],
+        "translations": list_translation_overview(session) if active == "translations" else [],
+        "variant_translations": list_variant_translation_overview(session) if active == "translations" else [],
+        "technical_attribute_label_translations": list_technical_attribute_label_translations(session) if active == "translations" else [],
+        "technical_attribute_value_translations": list_variant_technical_attribute_value_translations(session) if active == "translations" else [],
         "languages": list_languages(session),
         "translation_prompts": list_translation_prompts(session),
-        "rules": list_rule_overview(session),
+        "rules": list_rule_overview(session) if active == "rules" else [],
         "sales_channels": sales_channels,
         "channel_categories": channel_categories,
+        "price_lists": price_lists,
+        "price_list_options": [{"label": item["label"], "value": item["id"]} for item in price_lists],
+        "currency_rates": list_currency_rates(session) if active == "calculation" else [],
+        "cost_surcharges": list_cost_surcharges(session) if active == "calculation" else [],
         "brand_options": [{"label": item["name"], "value": item["name"]} for item in brands],
         "category_options": [
             {
@@ -1072,6 +1274,44 @@ def _page_rows(rows: list[dict] | None, pagination_info: dict | None) -> list[di
     return row_list[start:end]
 
 
+def _asset_public_url(session: Session, asset: Asset) -> str | None:
+    public_url = asset.public_url or safe_r2_public_url(asset.object_key)
+    if not public_url and asset.object_key:
+        try:
+            public_url = build_r2_storage(session).public_url(asset.object_key)
+        except Exception:
+            public_url = None
+    return public_url
+
+
+def _asset_file_fallback(session: Session, asset: Asset) -> Asset | None:
+    checksum = (asset.checksum or "").strip()
+    if not checksum:
+        return None
+    candidates = session.scalars(
+        select(Asset)
+        .where(Asset.id != asset.id, Asset.checksum == checksum)
+        .order_by(Asset.storage_provider.desc(), Asset.id.asc())
+    ).all()
+    scoped_candidates = [
+        candidate
+        for candidate in candidates
+        if (
+            (asset.product_id is not None and candidate.product_id == asset.product_id)
+            or (asset.variant_id is not None and candidate.variant_id == asset.variant_id)
+        )
+    ]
+    candidates = scoped_candidates or candidates
+    for candidate in candidates:
+        if candidate.storage_provider in {"cloudflare_r2", "bunny_storage"} and (
+            candidate.public_url or candidate.object_key
+        ):
+            return candidate
+        if candidate.storage_path and Path(candidate.storage_path).exists():
+            return candidate
+    return None
+
+
 def _float_or_none(value: object) -> float | None:
     if value in {None, ""}:
         return None
@@ -1101,6 +1341,24 @@ def _int_or_none(value: object) -> int | None:
 
 def _selected_ids(rows: list[dict] | None) -> list[int]:
     return [int(row["id"]) for row in (rows or []) if row.get("id") is not None]
+
+
+def _selected_ids_from_rows_or_store(rows: list[dict] | None, stored_ids: list[int] | None) -> list[int]:
+    row_ids = _selected_ids(rows)
+    if row_ids:
+        return sorted(set(row_ids))
+    return sorted({int(item) for item in (stored_ids or []) if item not in (None, "")})
+
+
+def _selected_variant_ids_for_delete(
+    variant_rows: list[dict] | None,
+    detail_variant_rows: list[dict] | None,
+    stored_ids: list[int] | None,
+) -> list[int]:
+    row_ids = [*_selected_ids(variant_rows), *_selected_ids(detail_variant_rows)]
+    if row_ids:
+        return sorted(set(row_ids))
+    return sorted({int(item) for item in (stored_ids or []) if item not in (None, "")})
 
 
 def _category_id_from_grid_state(
@@ -1215,6 +1473,88 @@ def _channel_bulk_category_dropdown_state(sales_channel_id: int | str | list | N
     return filtered, None, False, f"Vertriebskanal {channel_label} geladen. {len(filtered)} Kanal-Kategorien verfügbar."
 
 
+_GRID_VALUE_MISSING = object()
+
+
+def _grid_cell_change(event: dict | None) -> tuple[str | None, object]:
+    if not event:
+        return None, _GRID_VALUE_MISSING
+    changed_field = event.get("colId") or event.get("field") or event.get("columnId")
+    if not changed_field and isinstance(event.get("column"), dict):
+        changed_field = event["column"].get("colId") or event["column"].get("field")
+    if not changed_field and isinstance(event.get("column"), str):
+        changed_field = event.get("column")
+    if not changed_field and isinstance(event.get("colDef"), dict):
+        changed_field = event["colDef"].get("field") or event["colDef"].get("colId")
+
+    for key in ("newValue", "value", "new_value"):
+        if key in event:
+            return changed_field, event.get(key)
+    return changed_field, _GRID_VALUE_MISSING
+
+
+def _save_product_grid_row(session: Session, row: dict, *, changed_field: str | None = None, changed_value: object = _GRID_VALUE_MISSING) -> int:
+    product_id = row.get("id")
+    if not product_id:
+        raise ValueError("Produkt-ID fehlt.")
+    row = dict(row)
+    if changed_field and changed_value is not _GRID_VALUE_MISSING:
+        row[changed_field] = changed_value
+    detail = get_product_detail(session, int(product_id), include_sdb=False)
+    if detail is None:
+        raise ValueError(f"Produkt {product_id} nicht gefunden.")
+    update_product(
+        session,
+        int(product_id),
+        ProductUpdate(
+            sku=(row.get("sku") or detail.get("sku") or "").strip(),
+            title=(row.get("title") or detail["title"] or "").strip(),
+            description=detail.get("description"),
+            source_url=detail.get("source_url"),
+            source_url_final=detail.get("source_url_final"),
+            brand_name=row.get("brand") if "brand" in row else detail.get("brand_name"),
+            status=row.get("status") or detail.get("status") or "draft",
+            source_language=(row.get("source_language") or detail.get("source_language") or "en").strip(),
+            category_channel_code=detail.get("category_channel_code") or DEFAULT_CATEGORY_CHANNEL_CODE,
+            category_ids=detail.get("category_ids") or [],
+        ),
+    )
+    return int(product_id)
+
+
+def _save_variant_grid_row(session: Session, row: dict, *, changed_field: str | None = None, changed_value: object = _GRID_VALUE_MISSING) -> int:
+    variant_id = row.get("id")
+    if not variant_id:
+        raise ValueError("Varianten-ID fehlt.")
+    row = dict(row)
+    if changed_field and changed_value is not _GRID_VALUE_MISSING:
+        row[changed_field] = changed_value
+    update_variant(
+        session,
+        int(variant_id),
+        VariantUpdate(
+            sku=(row.get("sku") or "").strip(),
+            manufacturer_sku=(row.get("manufacturer_sku") or "").strip() or None,
+            vendor_description=(row.get("vendor_description") or "").strip() or None,
+            variant_title=row.get("variant_title"),
+            option_name=row.get("option_name"),
+            option_value=row.get("option_value"),
+            sales_unit=row.get("sales_unit"),
+            pack_quantity=_float_or_none(row.get("pack_quantity")),
+            pack_unit=row.get("pack_unit"),
+            packaging=row.get("packaging"),
+            price=_float_or_none(row.get("price")),
+            cost_price=_float_or_none(row.get("cost_price")),
+            currency=row.get("currency"),
+            cost_currency=row.get("cost_currency"),
+            stock_qty=_int_or_zero(row.get("stock_qty")),
+            barcode=row.get("barcode"),
+            status=row.get("status"),
+        ),
+    )
+    return int(variant_id)
+
+
 def _selected_channel_ids(value: int | str | list | None) -> list[int]:
     values = value if isinstance(value, list) else ([value] if value not in (None, "") else [])
     output: list[int] = []
@@ -1273,6 +1613,9 @@ def _variant_bulk_updates(
     barcode: str | None,
     option_name: str | None,
     option_value: str | None,
+    sales_unit: str | None,
+    pack_quantity: float | None,
+    pack_unit: str | None,
     packaging: str | None,
 ) -> dict[str, object]:
     selected = set(fields or [])
@@ -1286,6 +1629,9 @@ def _variant_bulk_updates(
         "barcode": barcode,
         "option_name": option_name,
         "option_value": option_value,
+        "sales_unit": sales_unit,
+        "pack_quantity": pack_quantity,
+        "pack_unit": pack_unit,
         "packaging": packaging,
     }
     return {field: values.get(field) for field in selected}
@@ -1584,9 +1930,86 @@ def _detail_source_short_description(detail: dict | None) -> str | None:
     return None
 
 
-def render_global_process_status(status: dict | None) -> html.Div:
+def _product_detail_original_values(detail: dict | None) -> dict:
+    if not detail:
+        return {}
+    return {
+        "id": detail.get("id"),
+        "sku": detail.get("sku"),
+        "title": detail.get("title"),
+        "brand": detail.get("brand_name"),
+        "status": detail.get("status"),
+        "source_language": detail.get("source_language") or "en",
+        "is_chemical": bool(detail.get("is_chemical")),
+        "category_channel_code": detail.get("category_channel_code") or DEFAULT_CATEGORY_CHANNEL_CODE,
+        "short_description": _detail_source_short_description(detail),
+        "description": detail.get("description"),
+        "source_url": detail.get("source_url"),
+        "source_url_final": detail.get("source_url_final"),
+    }
+
+
+def _process_status_duration(started_at: str | None, finished_at: str | None) -> str:
+    if not started_at:
+        return "-"
+    try:
+        start = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        end = datetime.fromisoformat(str(finished_at).replace("Z", "+00:00")) if finished_at else datetime.now(timezone.utc)
+    except ValueError:
+        return "-"
+    seconds = max(0, int((end - start).total_seconds()))
+    minutes, rest = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {rest}s"
+    if minutes:
+        return f"{minutes}m {rest}s"
+    return f"{rest}s"
+
+
+def _process_status_count(counters: dict, *keys: str) -> int | None:
+    for key in keys:
+        value = counters.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _process_status_detail_items(data: dict, progress_text: str, duration: str) -> list[object]:
+    options = data.get("options") or {}
+    selection = data.get("selection") or {}
+    counters = data.get("counters") or {}
+    detail_rows = [
+        ("Start", data.get("started_at") or "-"),
+        ("Ende", data.get("finished_at") or "-"),
+        ("Dauer", duration),
+        ("Fortschritt", progress_text),
+        ("Report", data.get("report_path") or "-"),
+        ("Optionen", options or "-"),
+        ("Quellen", options.get("sources") or options.get("source_locale") or "-"),
+        ("Zielsprachen", options.get("target_locales") or options.get("target_languages") or "-"),
+        ("Textqualität", options.get("text_quality") or options.get("quality") or "-"),
+        ("Auswahl", selection or "-"),
+        ("Zähler", counters or "-"),
+    ]
+    return [
+        html.Div([html.Strong(f"{label}: "), html.Span(json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value))])
+        for label, value in detail_rows
+    ]
+
+
+def ProcessStatusPanel(status: dict | None, ui_state: dict | None = None) -> html.Div:
     data = status or {}
     state = data.get("status") or "ready"
+    process_id = data.get("process_id")
+    if state == "ready" and not process_id:
+        return html.Div()
+    ui = ui_state or {}
+    if process_id and ui.get("hidden_process_id") == process_id and state not in {"running"}:
+        return html.Div()
     labels = {
         "ready": "Bereit",
         "running": "Läuft",
@@ -1595,16 +2018,9 @@ def render_global_process_status(status: dict | None) -> html.Div:
         "error": "Fehler",
         "cancelled": "Abgebrochen",
     }
-    color_map = {
-        "ready": ("#f8fafc", "#475569", "#cbd5e1"),
-        "running": ("#eff6ff", "#1d4ed8", "#93c5fd"),
-        "success": ("#ecfdf5", "#047857", "#86efac"),
-        "partial_success": ("#fffbeb", "#b45309", "#fcd34d"),
-        "error": ("#fef2f2", "#b91c1c", "#fecaca"),
-        "cancelled": ("#f8fafc", "#475569", "#cbd5e1"),
-    }
-    background, color, border = color_map.get(state, color_map["ready"])
-    running_hint = "Prozess läuft - bitte warten und keine weiteren Aktionen starten." if state == "running" else ""
+    icon_map = {"running": "↻", "success": "✓", "partial_success": "!", "error": "!", "cancelled": "×", "ready": "•"}
+    expanded = bool(ui.get("expanded"))
+    log_visible = bool(ui.get("log_visible"))
     counters = data.get("counters") or {}
     options = data.get("options") or {}
     selection = data.get("selection") or {}
@@ -1612,39 +2028,60 @@ def render_global_process_status(status: dict | None) -> html.Div:
     progress_total = data.get("progress_total") or 0
     progress_text = f"{progress_current} / {progress_total}" if progress_total else "-"
     messages = data.get("last_messages") or []
+    checked = _process_status_count(counters, "products_checked", "checked", "products")
+    suggestions = _process_status_count(counters, "field_suggestions", "suggestions", "products_with_suggestions", "applied")
+    duration = _process_status_duration(data.get("started_at"), data.get("finished_at"))
+    modifier = state if state in {"running", "success", "partial_success", "error", "cancelled"} else "ready"
     return html.Div(
         [
             html.Div(
                 [
-                    html.Strong(f"Prozessstatus: {labels.get(state, state)}"),
-                    html.Span(f" · {data.get('process_name') or 'Kein laufender Prozess'}"),
-                    html.Span(" · " + running_hint, style={"fontWeight": "700"}) if running_hint else html.Span(""),
-                ]
+                    html.Div(
+                        [
+                            html.Span(icon_map.get(state, "•"), className=f"process-status-icon process-status-icon-{modifier}"),
+                            html.Strong(labels.get(state, state)),
+                            html.Span(data.get("process_name") or "Prozess", className="process-status-name"),
+                            html.Span(f"Geprüft: {checked}" if checked is not None else "Geprüft: -", className="process-status-pill"),
+                            html.Span(f"Vorschläge: {suggestions}" if suggestions is not None else "Vorschläge: -", className="process-status-pill"),
+                        ],
+                        className="process-status-summary-main",
+                    ),
+                    html.Div(
+                        [
+                            html.Button(
+                                "Details ausblenden" if expanded else "Details anzeigen",
+                                id={"type": "process-status-action", "action": "details", "index": "global"},
+                                className="process-status-button",
+                            ),
+                            html.Button(
+                                "Prozess-Log ausblenden" if log_visible else "Prozess-Log anzeigen",
+                                id={"type": "process-status-action", "action": "log", "index": "global"},
+                                className="process-status-button",
+                                disabled=not bool(messages),
+                            ),
+                            html.Button("×", id={"type": "process-status-action", "action": "hide", "index": "global"}, title="Ausblenden", className="process-status-close-button"),
+                        ],
+                        className="process-status-actions",
+                    ),
+                ],
+                className="process-status-summary",
             ),
+            html.Div(_process_status_detail_items(data, progress_text, duration), className="process-status-details") if expanded else html.Div(),
+            html.Div(f"Fehler: {data.get('error_message')}", className="process-status-error-message") if data.get("error_message") else html.Div(),
             html.Div(
                 [
-                    html.Span(f"Start: {data.get('started_at') or '-'}"),
-                    html.Span(f" · Ende: {data.get('finished_at') or '-'}"),
-                    html.Span(f" · Fortschritt: {progress_text}"),
-                    html.Span(f" · Report: {data.get('report_path') or '-'}"),
-                ],
-                style={"fontSize": "13px"},
-            ),
-            html.Div(f"Optionen: {options or '-'} · Auswahl: {selection or '-'}", style={"fontSize": "13px"}) if state != "ready" else html.Div(),
-            html.Div(f"Zähler: {counters}", style={"fontSize": "13px"}) if counters else html.Div(),
-            html.Div(f"Fehler: {data.get('error_message')}", style={"fontSize": "13px", "fontWeight": "700"}) if data.get("error_message") else html.Div(),
-            html.Details(
-                [
-                    html.Summary("Prozess-Log anzeigen"),
-                    html.Pre("\n".join(messages[-50:]), style={"whiteSpace": "pre-wrap", "fontSize": "12px", "margin": "8px 0 0"}),
-                ],
-                open=state in {"running", "error"},
+                    html.Pre("\n".join(messages[-50:]), className="process-status-log"),
+                ]
             )
-            if messages
+            if log_visible and messages
             else html.Div(),
         ],
-        style={"background": background, "color": color, "border": f"1px solid {border}", "borderRadius": "10px", "padding": "10px 12px", "margin": "10px 0"},
+        className=f"process-status-panel process-status-panel-{modifier}",
     )
+
+
+def render_global_process_status(status: dict | None) -> html.Div:
+    return ProcessStatusPanel(status)
 
 
 def metric_card(title: str, store_key: str, button_id: str) -> html.Button:
@@ -1754,6 +2191,20 @@ def _render_asset_links(assets: list[dict] | None) -> html.Div:
             )
         )
     return html.Div(rows, style={"display": "grid", "gap": "6px"})
+
+
+def _variant_asset_rows(session: Session, variant_id: int | None, variant_row: dict | None = None) -> list[dict]:
+    if not variant_id:
+        return []
+    rows = [row for row in list_assets(session) if row.get("variant_id") == int(variant_id)]
+    for row in rows:
+        if not row.get("product_id") and variant_row:
+            row["product_id"] = variant_row.get("product_id")
+        if not row.get("product_sku") and variant_row:
+            row["product_sku"] = variant_row.get("product_sku")
+        if not row.get("product_title") and variant_row:
+            row["product_title"] = variant_row.get("product_title")
+    return rows
 
 
 def _normalized_asset_mime_type(asset: dict | None) -> str:
@@ -2578,14 +3029,22 @@ def grid(
     extra_grid_options: dict | None = None,
 ) -> dag.AgGrid:
     selection_mode = "singleRow" if row_selection == "single" else "multiRow"
-    grid_options = {"pagination": True, "paginationPageSize": 20, "rowSelection": {"mode": selection_mode}}
+    grid_options = {
+        "pagination": True,
+        "paginationPageSize": 20,
+        "paginationPageSizeSelector": [20, 50, 100],
+        "rowBuffer": 10,
+        "rowSelection": {"mode": selection_mode},
+        "stopEditingWhenCellsLoseFocus": True,
+        "enterNavigatesVerticallyAfterEdit": True,
+    }
     if extra_grid_options:
         grid_options.update(extra_grid_options)
     return dag.AgGrid(
         id=grid_id,
         rowData=row_data or [],
         columnDefs=columns,
-        defaultColDef={"resizable": True, "sortable": True, "filter": True, "editable": False},
+        defaultColDef={"resizable": True, "sortable": True, "filter": True, "filterParams": {"debounceMs": 350}, "editable": False},
         dashGridOptions=grid_options,
         style={"height": height},
     )
@@ -2696,10 +3155,9 @@ def _render_dedupe_master(master: dict) -> html.Div:
     rows = [
         ("Produkt-ID", master.get("product_id")),
         ("Titel", master.get("title")),
-        ("SKU", master.get("sku")),
+        ("Produkt-SKU", master.get("sku")),
         ("Status", master.get("status")),
         ("Marke", master.get("brand")),
-        ("Family Key", master.get("family_key")),
         ("Varianten", master.get("variant_count")),
         ("Assets", master.get("asset_count")),
         ("VK/EK", f"{master.get('sale_price_count', 0)} / {master.get('cost_price_count', 0)}"),
@@ -2728,10 +3186,47 @@ def _product_enrichment_suggestion_rows(result: dict | None) -> list[dict]:
     for product_result in (result or {}).get("results", []):
         for suggestion in product_result.get("suggestions", []):
             row = dict(suggestion)
+            row["_row_id"] = (
+                f"{row.get('product_id') or ''}|{row.get('field_name') or ''}|"
+                f"{row.get('target_locale') or ''}|{row.get('source_url') or ''}|{len(rows)}"
+            )
             confidence = row.get("confidence")
             row["confidence"] = f"{float(confidence):.2f}" if confidence not in (None, "") else ""
             rows.append(row)
     return rows
+
+
+def _normalize_selected_locales(values: list[str] | str | None) -> list[str]:
+    if values is None:
+        return ["de-CH"]
+    raw_values = values if isinstance(values, list) else [values]
+    locales: list[str] = []
+    for value in raw_values:
+        locale = str(value or "").strip()
+        if locale and locale not in locales:
+            locales.append(locale)
+    return locales
+
+
+def _combine_product_data_enrichment_results(results: list[dict[str, object]], target_locales: list[str]) -> dict[str, object]:
+    product_results: list[dict[str, object]] = []
+    products_checked: set[int] = set()
+    for result in results:
+        for product_result in result.get("results", []):
+            row = dict(product_result)
+            product_id = int(row.get("product_id") or 0)
+            if product_id:
+                products_checked.add(product_id)
+            suggestions = list(row.get("suggestions") or [])
+            row["target_locale"] = suggestions[0].get("target_locale") if suggestions else None
+            product_results.append(row)
+    return {
+        "status": "completed",
+        "products_checked": len(products_checked),
+        "target_locales": target_locales,
+        "products_with_suggestions": sum(1 for row in product_results if row.get("suggestions")),
+        "results": product_results,
+    }
 
 
 def _product_enrichment_warnings(result: dict | None) -> html.Div:
@@ -2836,12 +3331,7 @@ def create_dash_app() -> Dash:
             if asset is None:
                 abort(404)
             if asset.storage_provider in {"cloudflare_r2", "bunny_storage"}:
-                public_url = asset.public_url or safe_r2_public_url(asset.object_key)
-                if not public_url and asset.object_key:
-                    try:
-                        public_url = build_r2_storage(session).public_url(asset.object_key)
-                    except Exception:
-                        public_url = None
+                public_url = _asset_public_url(session, asset)
                 if public_url:
                     return redirect(public_url, code=302)
                 object_key = asset.object_key or object_key_from_storage_path(asset.storage_path)
@@ -2853,6 +3343,14 @@ def create_dash_app() -> Dash:
                     abort(404)
             path = Path(asset.storage_path)
             if not path.exists():
+                fallback_asset = _asset_file_fallback(session, asset)
+                if fallback_asset is not None:
+                    public_url = _asset_public_url(session, fallback_asset)
+                    if public_url:
+                        return redirect(public_url, code=302)
+                    fallback_path = Path(fallback_asset.storage_path)
+                    if fallback_path.exists():
+                        return send_file(fallback_path, mimetype=fallback_asset.mime_type, download_name=fallback_asset.original_filename, conditional=True)
                 abort(404)
             return send_file(path, mimetype=asset.mime_type, download_name=asset.original_filename, conditional=True)
 
@@ -2862,7 +3360,24 @@ def create_dash_app() -> Dash:
             asset = session.get(Asset, asset_id)
             if asset is None or not str(asset.mime_type or "").lower().startswith("image/"):
                 abort(404)
+            if asset.storage_provider in {"cloudflare_r2", "bunny_storage"}:
+                public_url = _asset_public_url(session, asset)
+                if public_url:
+                    return redirect(public_url, code=302)
             path = Path(asset.storage_path)
+            if not path.exists():
+                fallback_asset = _asset_file_fallback(session, asset)
+                if fallback_asset is not None:
+                    public_url = _asset_public_url(session, fallback_asset)
+                    if public_url:
+                        return redirect(public_url, code=302)
+                    fallback_path = Path(fallback_asset.storage_path)
+                    if fallback_path.exists():
+                        path = fallback_path
+                    else:
+                        abort(404)
+                else:
+                    abort(404)
             if not path.exists():
                 abort(404)
             thumb_dir = get_pim_settings().asset_storage_root / "_thumbs"
@@ -3038,6 +3553,7 @@ def create_dash_app() -> Dash:
             dcc.Store(id="snapshot-store"),
             dcc.Store(id="selected-product-ids", data=[]),
             dcc.Store(id="product-focus-id"),
+            dcc.Store(id="product-table-focus-id"),
             dcc.Store(id="last-product-clicked-id"),
             dcc.Store(id="last-product-click-event"),
             dcc.Store(id="active-product-row"),
@@ -3058,12 +3574,21 @@ def create_dash_app() -> Dash:
             dcc.Store(id="product-text-enrichment-results", data={}),
             dcc.Store(id="rules-product-enrichment-results", data={}),
             dcc.Store(id="pim-import-job-store"),
+            dcc.Store(id="process-status-ui-state", data={}, storage_type="local"),
+            html.Button("", id="nav-families", style={"display": "none"}),
             dcc.Store(id="dedupe-refresh-token", data=0),
             dcc.Interval(id="global-process-status-poll", interval=3000, n_intervals=0),
+            dcc.Interval(id="process-status-auto-collapse", interval=10000, n_intervals=0, disabled=True, max_intervals=1),
             dcc.Interval(id="pim-import-job-poll", interval=1500, n_intervals=0, disabled=True),
             html.Div(
                 [
-                    html.H1("PIM/PAM Admin", className="page-title"),
+                    html.Div(
+                        [
+                            html.H1("PIM/PAM Admin", className="page-title"),
+                            html.Div(id="global-process-status"),
+                        ],
+                        className="page-header-left",
+                    ),
                     html.Div(
                         [
                             html.Button("Dashboard", id="open-dashboard-button"),
@@ -3076,11 +3601,24 @@ def create_dash_app() -> Dash:
                 className="page-header",
             ),
             html.Div(id="flash-message", className="flash"),
-            html.Div(id="global-process-status"),
             dcc.ConfirmDialog(id="channel-bulk-confirm"),
             dcc.ConfirmDialog(id="product-bulk-edit-confirm"),
             dcc.ConfirmDialog(id="variant-bulk-edit-confirm"),
             dcc.ConfirmDialog(id="dedupe-merge-confirm"),
+            dcc.ConfirmDialog(
+                id="product-hard-delete-confirm",
+                message=(
+                    "Artikel endgültig löschen? Artikel, Varianten, Assets, Übersetzungen, Preise, "
+                    "Kanal-/Medusa-Zuordnungen und weitere abhängige Daten werden dauerhaft aus der Datenbank entfernt."
+                ),
+            ),
+            dcc.ConfirmDialog(
+                id="products-selection-delete-confirm",
+                message=(
+                    "Markierte Produkte endgültig löschen? Produkte, zugehörige Varianten, Assets, Übersetzungen, "
+                    "Preise, Kanal-/Medusa-Zuordnungen und weitere abhängige Daten werden dauerhaft entfernt."
+                ),
+            ),
             dcc.ConfirmDialog(
                 id="variant-delete-confirm",
                 message=(
@@ -3229,13 +3767,16 @@ def create_dash_app() -> Dash:
                                                     {"label": "Barcode / EAN", "value": "barcode"},
                                                     {"label": "Optionsname", "value": "option_name"},
                                                     {"label": "Optionswert", "value": "option_value"},
+                                                    {"label": "Verkaufseinheit", "value": "sales_unit"},
+                                                    {"label": "Packmenge", "value": "pack_quantity"},
+                                                    {"label": "Packeinheit", "value": "pack_unit"},
                                                     {"label": "Packaging / Gebinde", "value": "packaging"},
                                                 ],
                                                 value=[],
                                             ),
                                         ]
                                     ),
-                                    html.Div([html.Label("Status"), dcc.Dropdown(id="variant-bulk-edit-status", options=[{"label": value, "value": value} for value in ["active", "inactive", "archived"]], value="active", clearable=False)]),
+                                    html.Div([html.Label("Status"), dcc.Dropdown(id="variant-bulk-edit-status", options=VARIANT_STATUS_OPTIONS, value="active", clearable=False)]),
                                     html.Div([html.Label("Verkaufspreis"), dcc.Input(id="variant-bulk-edit-price", type="number", step=0.01)]),
                                     html.Div([html.Label("Verkaufswährung"), dcc.Input(id="variant-bulk-edit-currency", placeholder="CHF / EUR")]),
                                     html.Div([html.Label("Einkaufspreis"), dcc.Input(id="variant-bulk-edit-cost-price", type="number", step=0.01)]),
@@ -3244,6 +3785,9 @@ def create_dash_app() -> Dash:
                                     html.Div([html.Label("Barcode / EAN"), dcc.Input(id="variant-bulk-edit-barcode", placeholder="Barcode")]),
                                     html.Div([html.Label("Optionsname"), dcc.Input(id="variant-bulk-edit-option-name", placeholder="z. B. Packaging")]),
                                     html.Div([html.Label("Optionswert"), dcc.Input(id="variant-bulk-edit-option-value", placeholder="z. B. 10 kg")]),
+                                    html.Div([html.Label("Verkaufseinheit"), dcc.Input(id="variant-bulk-edit-sales-unit", placeholder="Packung / Stück / Kanister")]),
+                                    html.Div([html.Label("Packmenge"), dcc.Input(id="variant-bulk-edit-pack-quantity", type="number", step=0.001)]),
+                                    html.Div([html.Label("Packeinheit"), dcc.Input(id="variant-bulk-edit-pack-unit", placeholder="Block / Stück / kg / l")]),
                                     html.Div([html.Label("Packaging / Gebinde"), dcc.Input(id="variant-bulk-edit-packaging", placeholder="z. B. 10 kg Kanister")]),
                                     html.Div(
                                         [
@@ -3399,11 +3943,41 @@ def create_dash_app() -> Dash:
                                                             dcc.Checklist(
                                                                 id="product-data-enrichment-sources",
                                                                 options=[
+                                                                    {"label": "Datasheet-Assets verwenden", "value": "asset_datasheet"},
+                                                                    {"label": "SDS/SDB-Assets verwenden", "value": "asset_sds"},
+                                                                    {"label": "Asset-Texte mit KI schön formulieren", "value": "asset_ai"},
                                                                     {"label": "Final URL verwenden", "value": "final_url"},
                                                                     {"label": "Source-URL verwenden", "value": "source_url"},
                                                                     {"label": "bekannte Domains als Suchhinweis", "value": "configured_domains"},
                                                                 ],
-                                                                value=["final_url", "source_url", "configured_domains"],
+                                                                value=["asset_datasheet", "asset_sds", "asset_ai", "final_url", "source_url", "configured_domains"],
+                                                            ),
+                                                        ]
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Label("Zielsprachen"),
+                                                            dcc.Dropdown(
+                                                                id="product-data-enrichment-target-languages",
+                                                                options=LANGUAGE_CODE_OPTIONS,
+                                                                value=["de-CH"],
+                                                                multi=True,
+                                                                clearable=False,
+                                                            ),
+                                                            html.Div(
+                                                                html.Label("Textqualität"),
+                                                                style={"marginTop": "12px"},
+                                                            ),
+                                                            dcc.Checklist(
+                                                                id="product-data-enrichment-text-quality",
+                                                                options=[
+                                                                    {"label": "Markdown formatieren", "value": "markdown"},
+                                                                    {"label": "Abschnitte strukturieren", "value": "structure_sections"},
+                                                                    {"label": "B2B-Text glätten", "value": "b2b_smooth"},
+                                                                    {"label": "SDS/Datasheet-Rohtext bereinigen", "value": "clean_supplier_text"},
+                                                                    {"label": "SEO aus Beschreibung ableiten", "value": "derive_seo"},
+                                                                ],
+                                                                value=["markdown", "structure_sections", "b2b_smooth", "clean_supplier_text", "derive_seo"],
                                                             ),
                                                         ]
                                                     ),
@@ -3427,22 +4001,64 @@ def create_dash_app() -> Dash:
                                             ),
                                             dcc.Loading(html.Div(id="product-data-enrichment-status", className="selection-summary", style={"marginTop": "12px"}), type="default"),
                                             grid("product-data-enrichment-suggestions-grid", PRODUCT_ENRICHMENT_SUGGESTION_COLUMNS, height="330px", row_selection="multiple"),
+                                            html.Div(
+                                                [
+                                                    html.Div(id="product-data-enrichment-selected-meta", className="selection-summary"),
+                                                    html.Div(
+                                                        [
+                                                            html.Div(
+                                                                [
+                                                                    html.Label("Aktueller Wert"),
+                                                                    dcc.Textarea(
+                                                                        id="product-data-enrichment-selected-current",
+                                                                        readOnly=True,
+                                                                        style={"width": "100%", "height": "120px"},
+                                                                    ),
+                                                                ]
+                                                            ),
+                                                            html.Div(
+                                                                [
+                                                                    html.Label("Quelle / Ausgangstext"),
+                                                                    dcc.Textarea(
+                                                                        id="product-data-enrichment-selected-original",
+                                                                        readOnly=True,
+                                                                        style={"width": "100%", "height": "120px"},
+                                                                    ),
+                                                                ]
+                                                            ),
+                                                        ],
+                                                        className="detail-columns",
+                                                        style={"marginTop": "10px"},
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Label("Vorschlag ansehen / bearbeiten"),
+                                                            dcc.Textarea(
+                                                                id="product-data-enrichment-selected-suggestion-value",
+                                                                placeholder="Vorschlag in der Tabelle markieren, dann hier vollständig lesen oder bearbeiten.",
+                                                                style={"width": "100%", "height": "260px", "fontFamily": "monospace"},
+                                                            ),
+                                                        ],
+                                                        style={"marginTop": "10px"},
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.Button("Geänderten Vorschlag in Tabelle übernehmen", id="product-data-enrichment-update-selected-suggestion-button"),
+                                                        ],
+                                                        className="button-row",
+                                                        style={"marginTop": "8px"},
+                                                    ),
+                                                ],
+                                                className="panel",
+                                                style={"marginTop": "12px"},
+                                            ),
                                             html.Div(id="product-data-enrichment-warnings", className="selection-summary", style={"marginTop": "12px"}),
                                         ],
                                         className="unified-enrichment-card",
                                     ),
                                     html.Div(
                                         [
-                                            html.H4("2. Produkt-Assets holen", className="unified-enrichment-title"),
-                                            html.P("Sucht fehlende Bilder, PDFs, SDB/SDS und Datenblätter für die markierten Produkte. Bestehende Assets werden nicht überschrieben.", className="form-hint"),
-                                            html.Button("Fehlende Produkt-Assets anreichern", id="product-asset-enrichment-run-button", className="crawler-primary-button"),
-                                            dcc.Loading(html.Div(id="product-asset-enrichment-status", className="selection-summary", style={"marginTop": "12px"}), type="default"),
-                                        ],
-                                        className="unified-enrichment-card",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.H4("3. Beschreibungen aus Final URLs importieren", className="unified-enrichment-title"),
+                                            html.H4("2. Beschreibungen aus Final URLs importieren", className="unified-enrichment-title"),
                                             html.P("Liest vorhandene Final URLs aus, extrahiert Beschreibung und Kurzbeschreibung und formatiert Langtexte als Markdown. Standard ist Dry-Run.", className="form-hint"),
                                             html.Div(
                                                 [
@@ -3506,7 +4122,7 @@ def create_dash_app() -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.H4("4. Sprachfelder / Texte / SEO", className="unified-enrichment-title"),
+                                            html.H4("3. Sprachfelder / Texte / SEO", className="unified-enrichment-title"),
                                             html.P(
                                                 "Ergänzt, formatiert und speichert Titel, Kurzbeschreibung, Beschreibung, SEO-Felder und Slugs je Sprache.",
                                                 className="form-hint",
@@ -3869,11 +4485,11 @@ def create_dash_app() -> Dash:
                                     html.Button("Assets", id="nav-assets", className="sidebar-nav-button"),
                                     html.Button("Importjobs", id="nav-jobs", className="sidebar-nav-button"),
                                     html.Button("Attribute", id="nav-attributes", className="sidebar-nav-button"),
-                                    html.Button("Familien", id="nav-families", className="sidebar-nav-button"),
                                     html.Button("Übersetzungen", id="nav-translations", className="sidebar-nav-button"),
                                     html.Button("Regeln / Anreicherung", id="nav-rules", className="sidebar-nav-button"),
                                     html.Button("Dubletten / Produkt-Merge", id="nav-dedupe", className="sidebar-nav-button"),
                                     html.Button("Compliance Schweiz / SUVA", id="nav-compliance-swiss", className="sidebar-nav-button"),
+                                    html.Button("Kalkulation", id="nav-calculation", className="sidebar-nav-button"),
                                     html.Button("Medusa Schnittstelle", id="nav-medusa", className="sidebar-nav-button"),
                                 ],
                                 id="sidebar-nav",
@@ -3912,22 +4528,6 @@ def create_dash_app() -> Dash:
                         children=[
                             html.Div(
                                 [
-                                    html.Div(
-                                        [
-                                            html.Label("Produktstatus anzeigen"),
-                                            dcc.Dropdown(
-                                                id="product-list-status-filter",
-                                                options=[
-                                                    {"label": "Aktive Produkte", "value": "active"},
-                                                    {"label": "Archivierte Produkte", "value": "archived"},
-                                                    {"label": "Alle Produkte", "value": "all"},
-                                                ],
-                                                value="active",
-                                                clearable=False,
-                                            ),
-                                        ],
-                                        style={"maxWidth": "320px", "marginBottom": "12px"},
-                                    ),
                                     html.Div(id="product-channel-action-count", style={"fontWeight": "600"}),
                                     dcc.Checklist(
                                         id="product-channel-include-variants",
@@ -3944,6 +4544,9 @@ def create_dash_app() -> Dash:
                                             html.Button("Übersetzungen erstellen", id="product-translation-open-button"),
                                             html.Button("Übersetzungs-Prompts", id="product-translation-prompts-button"),
                                             html.Button("Produktdaten anreichern", id="product-data-enrichment-open-button"),
+                                            html.Button("Produkt-Assets holen", id="product-asset-enrichment-direct-button"),
+                                            html.Button("Produkt speichern", id="product-selection-save-button"),
+                                            html.Button("Produkt löschen", id="product-selection-delete-button"),
                                         ],
                                         className="button-row",
                                     ),
@@ -3966,7 +4569,7 @@ def create_dash_app() -> Dash:
                                             ),
                                             html.Div(
                                                 [
-                                                    html.Label("Artikelnummer (SKU)"),
+                                                    html.Label("Produkt-SKU / Artikelfamilie"),
                                                     dcc.Input(id="product-sku", style={"width": "100%"}),
                                                 ]
                                             ),
@@ -3984,7 +4587,8 @@ def create_dash_app() -> Dash:
                                             html.Div(
                                                 [
                                                     html.Label("Marke"),
-                                                    dcc.Dropdown(id="product-brand", placeholder="Marke"),
+                                                    dcc.Input(id="product-brand", placeholder="Marke", list="product-brand-options", style={"width": "100%"}),
+                                                    html.Datalist(id="product-brand-options"),
                                                 ]
                                             ),
                                             html.Div(
@@ -3992,7 +4596,7 @@ def create_dash_app() -> Dash:
                                                     html.Label("Status"),
                                                     dcc.Dropdown(
                                                         id="product-status",
-                                                        options=PUBLICATION_STATUS_OPTIONS,
+                                                        options=PRODUCT_STATUS_OPTIONS,
                                                         value="draft",
                                                     ),
                                                 ]
@@ -4082,9 +4686,22 @@ def create_dash_app() -> Dash:
                                             html.Button("Neu anlegen", id="product-create-button"),
                                             html.Button("Speichern", id="product-save-button"),
                                             html.Button("Archivieren", id="product-archive-button"),
+                                            html.Button("Artikel endgültig löschen", id="product-hard-delete-button"),
                                             html.Button("Zur Chemieansicht", id="product-open-chemistry-button", style={"display": "none"}),
                                         ],
                                         className="button-row",
+                                    ),
+                                    html.Div(id="product-detail-dirty-state", className="selection-summary"),
+                                    dcc.Store(id="product-detail-original-values", data={}),
+                                    html.Div(
+                                        [
+                                            html.Label("Löschbestätigung Produkt-SKU oder ID"),
+                                            dcc.Input(
+                                                id="product-hard-delete-confirmation",
+                                                placeholder="Produkt-SKU oder Produkt-ID exakt eingeben",
+                                                style={"width": "100%"},
+                                            ),
+                                        ]
                                     ),
                                 ],
                                 className="form-grid",
@@ -4149,14 +4766,19 @@ def create_dash_app() -> Dash:
                                                     ),
                                                     html.Div(
                                                         [
-                                                            html.H4("Staffelpreise"),
-                                                            grid("product-detail-tiers", DETAIL_TIER_COLUMNS, height="240px"),
+                                                            html.Div(
+                                                                [
+                                                                    html.H4("Staffelpreise", style={"margin": "0"}),
+                                                                    html.Button("Ausgewählte Staffelpreise löschen", id="product-detail-tier-delete-selected-button"),
+                                                                ],
+                                                                className="button-row",
+                                                            ),
+                                                            grid("product-detail-tiers", DETAIL_TIER_COLUMNS, height="240px", row_selection="multiple"),
                                                         ],
                                                         className="panel",
                                                     ),
                                                 ],
-                                                className="detail-columns",
-                                                style={"marginTop": "12px"},
+                                                style={"display": "grid", "gridTemplateColumns": "1fr", "gap": "12px", "marginTop": "12px"},
                                             )
                                         ],
                                     ),
@@ -4170,44 +4792,62 @@ def create_dash_app() -> Dash:
                                                 [
                                                     html.Div(
                                                         [
-                                                            html.H4("Assets"),
                                                             html.Div(
                                                                 [
-                                                                    html.Button("Asset nach oben", id="asset-move-up-button"),
-                                                                    html.Button("Asset nach unten", id="asset-move-down-button"),
-                                                                    html.Button("Asset löschen", id="asset-delete-button"),
+                                                                    html.H4("Asset hochladen", style={"margin": "0 0 6px 0"}),
+                                                                    dcc.Dropdown(
+                                                                        id="asset-upload-language-code",
+                                                                        options=LANGUAGE_CODE_OPTIONS,
+                                                                        placeholder="Sprache optional",
+                                                                        clearable=True,
+                                                                        style={"width": "300px", "maxWidth": "100%", "marginBottom": "6px"},
+                                                                    ),
+                                                                    dcc.Upload(
+                                                                        id="asset-upload",
+                                                                        children=html.Div(["Datei hier ablegen oder klicken"]),
+                                                                        style={
+                                                                            "width": "300px",
+                                                                            "maxWidth": "100%",
+                                                                            "height": "46px",
+                                                                            "lineHeight": "46px",
+                                                                            "borderWidth": "1px",
+                                                                            "borderStyle": "dashed",
+                                                                            "borderRadius": "4px",
+                                                                            "textAlign": "center",
+                                                                            "background": "#f8fafc",
+                                                                        },
+                                                                    ),
                                                                 ],
-                                                                className="button-row",
+                                                                style={"flex": "0 0 320px"},
                                                             ),
-                                                            grid("product-detail-assets", DETAIL_ASSET_COLUMNS, height="300px"),
-                                                            html.Div(id="product-detail-asset-links", style={"marginTop": "10px"}),
-                                                            html.Div(id="product-detail-asset-preview", style={"marginTop": "10px"}),
-                                                        ],
-                                                        className="panel",
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.H4("Asset hochladen"),
-                                                            html.Div(id="asset-upload-status", className="selection-summary"),
-                                                            dcc.Upload(
-                                                                id="asset-upload",
-                                                                children=html.Div(["Datei hier ablegen oder klicken"]),
-                                                                style={
-                                                                    "width": "100%",
-                                                                    "height": "60px",
-                                                                    "lineHeight": "60px",
-                                                                    "borderWidth": "1px",
-                                                                    "borderStyle": "dashed",
-                                                                    "borderRadius": "4px",
-                                                                    "textAlign": "center",
-                                                                    "marginBottom": "12px",
-                                                                },
+                                                            html.Div(
+                                                                [
+                                                                    html.H4("Assets", style={"margin": "0 0 6px 0"}),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Button("Asset nach oben", id="asset-move-up-button"),
+                                                                            html.Button("Asset nach unten", id="asset-move-down-button"),
+                                                                            html.Button("Ausgewählte Assets löschen", id="asset-delete-button"),
+                                                                        ],
+                                                                        className="button-row",
+                                                                    ),
+                                                                ],
+                                                                style={"flex": "1 1 auto"},
                                                             ),
                                                         ],
-                                                        className="panel",
+                                                        style={
+                                                            "display": "flex",
+                                                            "gap": "14px",
+                                                            "alignItems": "flex-start",
+                                                            "flexWrap": "wrap",
+                                                        },
                                                     ),
+                                                    html.Div(id="asset-upload-status", className="selection-summary", style={"marginTop": "8px"}),
+                                                    grid("product-detail-assets", DETAIL_ASSET_COLUMNS, height="360px", row_selection="multiple"),
+                                                    html.Div(id="product-detail-asset-links", style={"marginTop": "10px"}),
+                                                    html.Div(id="product-detail-asset-preview", style={"marginTop": "10px"}),
                                                 ],
-                                                className="detail-columns",
+                                                className="panel",
                                                 style={"marginTop": "12px"},
                                             )
                                         ],
@@ -4403,7 +5043,7 @@ def create_dash_app() -> Dash:
                                                         id="chemistry-filter-status",
                                                         options=[
                                                             {"label": "Alle", "value": "all"},
-                                                            *PUBLICATION_STATUS_OPTIONS,
+                                                            *PRODUCT_STATUS_OPTIONS,
                                                         ],
                                                         value="all",
                                                         clearable=False,
@@ -4449,7 +5089,7 @@ def create_dash_app() -> Dash:
                                                                                     html.Label("Status"),
                                                                                     dcc.Dropdown(
                                                                                         id="chemistry-product-status",
-                                                                                        options=PUBLICATION_STATUS_OPTIONS,
+                                                                                        options=PRODUCT_STATUS_OPTIONS,
                                                                                         value="draft",
                                                                                         clearable=False,
                                                                                     ),
@@ -5109,26 +5749,11 @@ def create_dash_app() -> Dash:
                         children=[
                             html.Div(
                                 [
-                                    html.Label("Variantenstatus anzeigen"),
-                                    dcc.Dropdown(
-                                        id="variant-list-status-filter",
-                                        options=[
-                                            {"label": "Aktive Varianten", "value": "active"},
-                                            {"label": "Archivierte Varianten", "value": "archived"},
-                                            {"label": "Alle Varianten", "value": "all"},
-                                        ],
-                                        value="active",
-                                        clearable=False,
-                                    ),
-                                ],
-                                style={"maxWidth": "320px", "marginBottom": "12px"},
-                            ),
-                            html.Div(
-                                [
                                     html.Div(id="variant-channel-action-count", style={"fontWeight": "600"}),
                                     html.Div(
                                         [
                                             html.Button("Variante bearbeiten", id="variant-edit-selected-button"),
+                                            html.Button("Variante speichern", id="variant-selection-save-button"),
                                             html.Button("Markierte Varianten bearbeiten", id="variant-bulk-edit-open-button"),
                                             html.Button("Kanal-Aktionen", id="variant-channel-action-open-button"),
                                             html.Button("Varianten-Listings", id="variant-listings-action-open-button"),
@@ -5145,138 +5770,304 @@ def create_dash_app() -> Dash:
                             ),
                             grid("variants-grid", VARIANT_COLUMNS, height="520px", row_selection="multiple"),
                             html.Div(id="variant-selection-summary", className="selection-summary"),
-                            html.Div(
-                                [
-                                    html.Div(
-                                        [
-                                            html.H4("Staffelpreis anlegen/aktualisieren"),
+                            dcc.Tabs(
+                                id="variant-detail-tabs",
+                                value="variant-master-data",
+                                className="detail-tabs",
+                                children=[
+                                    dcc.Tab(
+                                        label="Stammdaten",
+                                        value="variant-master-data",
+                                        className="detail-tab",
+                                        selected_className="detail-tab-selected",
+                                        children=[
                                             html.Div(
                                                 [
-                                                    dcc.Dropdown(
-                                                        id="tier-price-type",
-                                                        options=[
-                                                            {"label": "sale", "value": "sale"},
-                                                            {"label": "purchase", "value": "purchase"},
+                                                    html.Div(
+                                                        [
+                                                            html.Div(
+                                                                [
+                                                                    html.Div([html.Label("ID"), dcc.Input(id="variant-id", type="number", placeholder="ID", disabled=True, style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Variantentitel"), dcc.Input(id="variant-title", placeholder="Variantentitel", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Vendor-SKU"), dcc.Input(id="variant-manufacturer-sku", placeholder="Vendor-SKU", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Vendor-Beschr."), dcc.Input(id="variant-vendor-description", placeholder="Lieferantenbeschreibung", style={"width": "100%"})]),
+                                                                ],
+                                                                className="variant-form-row variant-form-row--wide",
+                                                            ),
+                                                            html.Div(
+                                                                [
+                                                                    html.Div([html.Label("Attribut"), dcc.Input(id="variant-option-name", placeholder="Attribut", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Wert"), dcc.Input(id="variant-option-value", placeholder="Wert", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Verkaufseinheit"), dcc.Input(id="variant-sales-unit", placeholder="Packung / Stück / Kanister", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Packmenge"), dcc.Input(id="variant-pack-quantity", type="number", step=0.001, placeholder="20", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Packeinheit"), dcc.Input(id="variant-pack-unit", placeholder="Block / Stück / Liter / kg", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Packaging"), dcc.Input(id="variant-packaging", placeholder="Anzeige/Fallback", style={"width": "100%"})]),
+                                                                ],
+                                                                className="variant-form-row",
+                                                            ),
+                                                            html.Div(
+                                                                [
+                                                                    html.Div([html.Label("Preis"), dcc.Input(id="variant-price", type="number", placeholder="Preis", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Einkaufspreis"), dcc.Input(id="variant-cost-price", type="number", placeholder="Einkaufspreis", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Währung"), dcc.Input(id="variant-currency", placeholder="Währung", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("EK-Währung"), dcc.Input(id="variant-cost-currency", placeholder="EK-Währung", style={"width": "100%"})]),
+                                                                ],
+                                                                className="variant-form-row",
+                                                            ),
+                                                            html.Div(
+                                                                [
+                                                                    html.Div([html.Label("Bestand"), dcc.Input(id="variant-stock", type="number", placeholder="Bestand", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Barcode"), dcc.Input(id="variant-barcode", placeholder="Barcode", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Status"), dcc.Dropdown(id="variant-status", options=VARIANT_STATUS_OPTIONS, value="active", clearable=False)]),
+                                                                    html.Div([html.Label("Aktion"), html.Button("Variante speichern", id="variant-save-button")]),
+                                                                ],
+                                                                className="variant-form-row variant-form-row--compact",
+                                                            ),
                                                         ],
-                                                        value="sale",
+                                                        className="variant-form-card",
                                                     ),
-                                                    dcc.Input(id="tier-min-qty", type="number", placeholder="Min. Menge", value=1),
-                                                    dcc.Input(id="tier-max-qty", type="number", placeholder="Max. Menge"),
-                                                    dcc.Input(id="tier-price", type="number", placeholder="Preis"),
-                                                    dcc.Input(id="tier-currency", placeholder="Währung", value="EUR"),
-                                                    html.Button("Staffelpreis speichern", id="tier-save-button"),
+                                                    html.Div(
+                                                        [
+                                                            html.H4("Technische Stammdaten", style={"margin": "0 0 8px 0"}),
+                                                            html.Div(
+                                                                [
+                                                                    dcc.Input(id="variant-technical-attribute-id", type="number", style={"display": "none"}),
+                                                                    html.Div([html.Label("Attribut"), dcc.Dropdown(id="variant-technical-attribute-name", options=[{"label": value, "value": value} for value in ["Rollenlänge", "Rollenbreite", "Folienstärke", "Material", "Recyclingfähig", "Lebensmittelgeeignet", "Ausführung", "Verschluss", "Verpackungseinheit", "Farbe", "Format / Masse", "Breite", "Höhe", "Durchmesser", "Kerndurchmesser", "Beschichtung", "Bedruckt", "Perforation", "Temperaturbeständigkeit", "Eignung"]], placeholder="Attribut")]),
+                                                                    html.Div([html.Label("Wert Text"), dcc.Input(id="variant-technical-value-text", placeholder="LDPE / ja / Zugband", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Wert Zahl"), dcc.Input(id="variant-technical-value-number", type="number", step=0.0001, placeholder="850", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Einheit"), dcc.Input(id="variant-technical-unit", placeholder="m / cm / µm / mm / Stück", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Sortierung"), dcc.Input(id="variant-technical-sort-order", type="number", value=0, style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Aktion"), html.Button("Technikwert speichern", id="variant-technical-save-button")]),
+                                                                    html.Button("Neuer Technikwert", id="variant-technical-new-button"),
+                                                                    html.Button("Ausgewählte Technikwerte löschen", id="variant-technical-delete-button"),
+                                                                ],
+                                                                className="variant-technical-form-grid",
+                                                            ),
+                                                            grid("variant-technical-attributes-grid", VARIANT_TECHNICAL_ATTRIBUTE_COLUMNS, height="230px", row_selection="multiple"),
+                                                            html.Div(id="variant-technical-summary", className="selection-summary", style={"marginTop": "8px"}),
+                                                        ],
+                                                        className="panel variant-technical-card",
+                                                    ),
                                                 ],
-                                                className="form-grid",
+                                                className="variant-master-layout",
                                             ),
                                         ],
-                                        className="panel",
                                     ),
-                                    html.Div(
-                                        [
+                                    dcc.Tab(
+                                        label="Preislisten / Staffelpreise",
+                                        value="variant-prices",
+                                        className="detail-tab",
+                                        selected_className="detail-tab-selected",
+                                        children=[
                                             html.Div(
                                                 [
                                                     html.Div(
                                                         [
-                                                            html.Label("ID"),
-                                                            dcc.Input(id="variant-id", type="number", placeholder="ID", disabled=True, style={"width": "100%"}),
-                                                        ]
+                                                            html.Div(
+                                                                [
+                                                                    html.H4("Preis- und Staffelpreise", style={"margin": "0"}),
+                                                                    html.Button("Ausgewählte Staffelpreise löschen", id="variant-tier-delete-selected-button"),
+                                                                ],
+                                                                className="button-row",
+                                                            ),
+                                                            grid("variant-tier-grid", DETAIL_TIER_COLUMNS, height="360px", row_selection="multiple"),
+                                                        ],
+                                                        className="panel",
                                                     ),
                                                     html.Div(
                                                         [
-                                                            html.Label("Variantentitel"),
-                                                            dcc.Input(id="variant-title", placeholder="Variantentitel", style={"width": "100%"}),
-                                                        ]
+                                                            html.H4("Preis / Staffelpreis anlegen oder aktualisieren"),
+                                                            html.Div(
+                                                                [
+                                                                    html.Div([html.Label("Preisliste"), dcc.Dropdown(id="tier-price-list-id", placeholder="Preisliste, leer = Basispreis")]),
+                                                                    html.Div([html.Label("Typ"), dcc.Dropdown(id="tier-price-type", options=[{"label": value, "value": value} for value in ["sale", "purchase", "special", "override"]], value="sale")]),
+                                                                    html.Div([html.Label("Min. Menge"), dcc.Input(id="tier-min-qty", type="number", placeholder="Min. Menge", value=1, style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Max. Menge"), dcc.Input(id="tier-max-qty", type="number", placeholder="Max. Menge", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Preis"), dcc.Input(id="tier-price", type="number", placeholder="Preis", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Währung"), dcc.Input(id="tier-currency", placeholder="Währung", value="EUR", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Status"), dcc.Dropdown(id="tier-status", options=[{"label": value, "value": value} for value in ["active", "inactive", "archived"]], value="active", clearable=False)]),
+                                                                    html.Div([html.Label("Aktion"), html.Button("Preis speichern", id="tier-save-button")]),
+                                                                ],
+                                                                className="form-grid variant-price-form-grid",
+                                                            ),
+                                                        ],
+                                                        className="panel",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.H4("Preisliste anlegen/aktualisieren"),
+                                                            html.Div(
+                                                                [
+                                                                    dcc.Input(id="price-list-id", type="number", style={"display": "none"}),
+                                                                    html.Div([html.Label("Code"), dcc.Input(id="price-list-code", placeholder="Code, z. B. magento_special", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Name"), dcc.Input(id="price-list-name", placeholder="Name", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Typ"), dcc.Dropdown(id="price-list-type", options=[{"label": value, "value": value} for value in ["sale", "override", "customer_group", "campaign"]], value="sale", clearable=False)]),
+                                                                    html.Div([html.Label("Kanal"), dcc.Dropdown(id="price-list-sales-channel-id", placeholder="Kanal, leer = alle")]),
+                                                                    html.Div([html.Label("Währung"), dcc.Input(id="price-list-currency", placeholder="Währung", value="CHF", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Gültig von"), dcc.Input(id="price-list-valid-from", placeholder="Gültig von YYYY-MM-DD", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Gültig bis"), dcc.Input(id="price-list-valid-to", placeholder="Gültig bis YYYY-MM-DD", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Status"), dcc.Dropdown(id="price-list-status", options=[{"label": value, "value": value} for value in ["active", "inactive", "archived"]], value="active", clearable=False)]),
+                                                                    html.Div([html.Label("Aktion"), html.Button("Preisliste speichern", id="price-list-save-button")]),
+                                                                ],
+                                                                className="form-grid variant-price-form-grid",
+                                                            ),
+                                                            grid("price-lists-grid", PRICE_LIST_COLUMNS, height="220px", row_selection="single"),
+                                                        ],
+                                                        className="panel",
                                                     ),
                                                 ],
-                                                className="variant-form-row variant-form-row--wide",
-                                            ),
-                                            html.Div(
-                                                [
-                                                    html.Div(
-                                                        [
-                                                            html.Label("Attribut"),
-                                                            dcc.Input(id="variant-option-name", placeholder="Attribut", style={"width": "100%"}),
-                                                        ]
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Label("Wert"),
-                                                            dcc.Input(id="variant-option-value", placeholder="Wert", style={"width": "100%"}),
-                                                        ]
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Label("Packaging"),
-                                                            dcc.Input(id="variant-packaging", placeholder="Packaging", style={"width": "100%"}),
-                                                        ]
-                                                    ),
-                                                ],
-                                                className="variant-form-row",
-                                            ),
-                                            html.Div(
-                                                [
-                                                    html.Div(
-                                                        [
-                                                            html.Label("Preis"),
-                                                            dcc.Input(id="variant-price", type="number", placeholder="Preis", style={"width": "100%"}),
-                                                        ]
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Label("Einkaufspreis"),
-                                                            dcc.Input(id="variant-cost-price", type="number", placeholder="Einkaufspreis", style={"width": "100%"}),
-                                                        ]
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Label("Währung"),
-                                                            dcc.Input(id="variant-currency", placeholder="Währung", style={"width": "100%"}),
-                                                        ]
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Label("EK-Währung"),
-                                                            dcc.Input(id="variant-cost-currency", placeholder="EK-Währung", style={"width": "100%"}),
-                                                        ]
-                                                    ),
-                                                ],
-                                                className="variant-form-row",
-                                            ),
-                                            html.Div(
-                                                [
-                                                    html.Div(
-                                                        [
-                                                            html.Label("Bestand"),
-                                                            dcc.Input(id="variant-stock", type="number", placeholder="Bestand", style={"width": "100%"}),
-                                                        ]
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Label("Barcode"),
-                                                            dcc.Input(id="variant-barcode", placeholder="Barcode", style={"width": "100%"}),
-                                                        ]
-                                                    ),
-                                                    html.Div(
-                                                        [
-                                                            html.Label("Aktion"),
-                                                            html.Button("Variante speichern", id="variant-save-button"),
-                                                        ]
-                                                    ),
-                                                ],
-                                                className="variant-form-row variant-form-row--compact",
-                                            ),
+                                                className="variant-tab-stack",
+                                            )
                                         ],
-                                        className="variant-form-card",
+                                    ),
+                                    dcc.Tab(
+                                        label="Zoll / Compliance",
+                                        value="variant-customs",
+                                        className="detail-tab",
+                                        selected_className="detail-tab-selected",
+                                        children=[
+                                            html.Div(
+                                                [
+                                                    html.Div(
+                                                        [
+                                                            html.H4("Schweiz Import"),
+                                                            html.Div(
+                                                                [
+                                                                    html.Div([html.Label("CH Tarifnummer"), dcc.Input(id="variant-ch-tariff-code", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("CH Stat. Schlüssel"), dcc.Input(id="variant-ch-statistical-key", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Ursprungsland"), dcc.Input(id="variant-origin-country", placeholder="IT, DE, CN ...", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Zollbeschreibung DE"), dcc.Textarea(id="variant-customs-description-de", style={"width": "100%", "height": "64px"})]),
+                                                                    html.Div([html.Label("Zollbeschreibung EN"), dcc.Textarea(id="variant-customs-description-en", style={"width": "100%", "height": "64px"})]),
+                                                                    html.Div([html.Label("Material / Zusammensetzung"), dcc.Textarea(id="variant-material-composition", style={"width": "100%", "height": "64px"})]),
+                                                                    html.Div([html.Label("Eigenmasse kg"), dcc.Input(id="variant-ch-net-mass-kg", type="number", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Rohmasse kg"), dcc.Input(id="variant-ch-gross-mass-kg", type="number", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Zoll-Mengeneinheit"), dcc.Input(id="variant-ch-customs-unit-code", placeholder="kg, l, Stk ...", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("Zoll-Menge je Variante"), dcc.Input(id="variant-ch-customs-quantity-per-unit", type="number", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("NZE-Code"), dcc.Input(id="variant-ch-nze-code", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("CH Flags"), dcc.Checklist(id="variant-ch-flags", options=[{"label": "Präferenz möglich", "value": "preference"}, {"label": "Ursprungsnachweis nötig", "value": "origin_proof"}, {"label": "NZE nötig", "value": "nze"}, {"label": "VOC relevant", "value": "voc"}], value=[])]),
+                                                                ],
+                                                                className="variant-form-row",
+                                                            ),
+                                                        ],
+                                                        className="panel",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.H4("EU / DE"),
+                                                            html.Div(
+                                                                [
+                                                                    html.Div([html.Label("EU/DE Export Warennummer"), dcc.Input(id="variant-eu-cn-code", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("EU TARIC Code"), dcc.Input(id="variant-eu-taric-code", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("DE Import-Code"), dcc.Input(id="variant-de-import-code", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("DE Mengeneinheit"), dcc.Input(id="variant-de-customs-unit-code", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("DE Menge je Variante"), dcc.Input(id="variant-de-customs-quantity-per-unit", type="number", style={"width": "100%"})]),
+                                                                    html.Div([html.Label("EU/DE Flags"), dcc.Checklist(id="variant-eu-flags", options=[{"label": "Exportkontrolle", "value": "export_control"}, {"label": "Dual-Use", "value": "dual_use"}, {"label": "REACH", "value": "reach"}, {"label": "Antidumping", "value": "antidumping"}], value=[])]),
+                                                                    html.Div([html.Label("Zollnotizen"), dcc.Textarea(id="variant-customs-notes", style={"width": "100%", "height": "64px"})]),
+                                                                ],
+                                                                className="variant-form-row",
+                                                            ),
+                                                        ],
+                                                        className="panel",
+                                                    ),
+                                                    html.Div(
+                                                        [
+                                                            html.H4("Zusatzcodes"),
+                                                            html.Div(
+                                                                [
+                                                                    dcc.Input(id="variant-customs-code-id", type="number", style={"display": "none"}),
+                                                                    dcc.Dropdown(id="variant-customs-code-jurisdiction", options=[{"label": value, "value": value} for value in ["CH", "EU", "DE"]], value="CH", clearable=False),
+                                                                    dcc.Dropdown(id="variant-customs-code-flow", options=[{"label": value, "value": value} for value in ["import", "export", "both"]], value="import", clearable=False),
+                                                                    dcc.Input(id="variant-customs-code-code", placeholder="Y901, Y921, NZE ..."),
+                                                                    dcc.Input(id="variant-customs-code-description", placeholder="Beschreibung"),
+                                                                    dcc.Input(id="variant-customs-code-valid-from", placeholder="Gültig von TT.MM.JJJJ"),
+                                                                    dcc.Input(id="variant-customs-code-valid-to", placeholder="Gültig bis TT.MM.JJJJ"),
+                                                                    dcc.Dropdown(id="variant-customs-code-status", options=[{"label": value, "value": value} for value in ["active", "inactive", "archived"]], value="active", clearable=False),
+                                                                    dcc.Input(id="variant-customs-code-source", placeholder="Quelle"),
+                                                                    html.Button("Neuer Zusatzcode", id="variant-customs-code-new-button"),
+                                                                    html.Button("Zusatzcode speichern", id="variant-customs-code-save-button"),
+                                                                ],
+                                                                className="form-grid",
+                                                            ),
+                                                            grid("variant-customs-codes-grid", VARIANT_CUSTOMS_CODE_COLUMNS, height="260px", row_selection="single"),
+                                                        ],
+                                                        className="panel",
+                                                    ),
+                                                ],
+                                                className="variant-tab-stack",
+                                            )
+                                        ],
+                                    ),
+                                    dcc.Tab(
+                                        label="Assets",
+                                        value="variant-assets",
+                                        className="detail-tab",
+                                        selected_className="detail-tab-selected",
+                                        children=[
+                                            html.Div(
+                                                [
+                                                    html.Div(
+                                                        [
+                                                            html.Div(
+                                                                [
+                                                                    html.H4("Asset hochladen", style={"margin": "0 0 6px 0"}),
+                                                                    dcc.Dropdown(
+                                                                        id="variant-asset-upload-language-code",
+                                                                        options=LANGUAGE_CODE_OPTIONS,
+                                                                        placeholder="Sprache optional",
+                                                                        clearable=True,
+                                                                        style={"width": "300px", "maxWidth": "100%", "marginBottom": "6px"},
+                                                                    ),
+                                                                    dcc.Upload(
+                                                                        id="variant-asset-upload",
+                                                                        children=html.Div(["Datei hier ablegen oder klicken"]),
+                                                                        style={
+                                                                            "width": "300px",
+                                                                            "maxWidth": "100%",
+                                                                            "height": "46px",
+                                                                            "lineHeight": "46px",
+                                                                            "borderWidth": "1px",
+                                                                            "borderStyle": "dashed",
+                                                                            "borderRadius": "4px",
+                                                                            "textAlign": "center",
+                                                                            "background": "#f8fafc",
+                                                                        },
+                                                                    ),
+                                                                ],
+                                                                style={"flex": "0 0 320px"},
+                                                            ),
+                                                            html.Div(
+                                                                [
+                                                                    html.H4("Varianten-Assets", style={"margin": "0 0 6px 0"}),
+                                                                    html.Div(
+                                                                        [
+                                                                            html.Button("Asset nach oben", id="variant-asset-move-up-button"),
+                                                                            html.Button("Asset nach unten", id="variant-asset-move-down-button"),
+                                                                            html.Button("Ausgewählte Assets löschen", id="variant-asset-delete-button"),
+                                                                        ],
+                                                                        className="button-row",
+                                                                    ),
+                                                                ],
+                                                                style={"flex": "1 1 auto"},
+                                                            ),
+                                                        ],
+                                                        style={
+                                                            "display": "flex",
+                                                            "gap": "14px",
+                                                            "alignItems": "flex-start",
+                                                            "flexWrap": "wrap",
+                                                        },
+                                                    ),
+                                                    html.Div(id="variant-asset-upload-status", className="selection-summary", style={"marginTop": "8px"}),
+                                                    grid("variant-detail-assets", DETAIL_ASSET_COLUMNS, height="360px", row_selection="multiple"),
+                                                    html.Div(id="variant-detail-asset-links", style={"marginTop": "10px"}),
+                                                    html.Div(id="variant-detail-asset-preview", style={"marginTop": "10px"}),
+                                                ],
+                                                className="panel",
+                                                style={"marginTop": "12px"},
+                                            )
+                                        ],
                                     ),
                                 ],
-                                className="variant-editor-layout",
-                            ),
-                            html.Div(
-                                [
-                                    html.H4("Preis- und Staffelpreise"),
-                                    grid("variant-tier-grid", DETAIL_TIER_COLUMNS, height="320px"),
-                                ],
-                                className="panel",
                             ),
                         ],
                     ),
@@ -5611,7 +6402,14 @@ def create_dash_app() -> Dash:
                                                     html.Button("Ausgewählte Assets löschen", id="assets-bulk-delete-button", className="danger-button"),
                                                     html.Button("Asset-Typ ändern", id="assets-bulk-type-button", disabled=True, title="TODO: Bulk-Metadatenänderung"),
                                                     html.Button("Produkt verknüpfen", id="assets-bulk-product-button", disabled=True, title="TODO: Bulk-Produktverknüpfung"),
-                                                    html.Button("Sprache setzen", id="assets-bulk-language-button", disabled=True, title="TODO: Bulk-Sprache setzen"),
+                                                    dcc.Dropdown(
+                                                        id="assets-bulk-language-code",
+                                                        options=[{"label": "(leer)", "value": ""}, *LANGUAGE_CODE_OPTIONS, {"label": "unknown", "value": "unknown"}],
+                                                        placeholder="Sprache",
+                                                        clearable=True,
+                                                        style={"width": "150px"},
+                                                    ),
+                                                    html.Button("Sprache setzen", id="assets-bulk-language-button"),
                                                     html.Button("Status ändern", id="assets-bulk-status-button", disabled=True, title="TODO: Bulk-Status ändern"),
                                                     html.Button("Links kopieren", id="assets-bulk-copy-links-button", disabled=True, title="TODO: Link-Export/Kopieren"),
                                                 ],
@@ -5895,10 +6693,10 @@ def create_dash_app() -> Dash:
                     ),
                     dcc.Tab(
                         value="families",
-                        label="Familien",
+                        label="",
                         style=HIDDEN_TAB_STYLE,
                         selected_style=HIDDEN_TAB_STYLE,
-                        children=[grid("families-grid", FAMILY_COLUMNS, height="520px")],
+                        children=[grid("families-grid", [], height="1px")],
                     ),
                     dcc.Tab(
                         value="translations",
@@ -5911,8 +6709,42 @@ def create_dash_app() -> Dash:
                                     html.Div([html.H4("Sprachen"), grid("languages-grid", LANGUAGE_COLUMNS, height="220px")], className="panel"),
                                     html.Div([html.H4("Produkt-Übersetzungen"), grid("translations-grid", TRANSLATION_COLUMNS, height="260px")], className="panel"),
                                     html.Div([html.H4("Varianten-Übersetzungen"), grid("variant-translations-grid", VARIANT_TRANSLATION_COLUMNS, height="260px")], className="panel"),
+                                    html.Div(
+                                        [
+                                            html.H4("Technische Attribut-Labels"),
+                                            html.Div(
+                                                [
+                                                    dcc.Input(id="technical-label-translation-id", type="number", style={"display": "none"}),
+                                                    html.Div([html.Label("Code"), dcc.Input(id="technical-label-code", placeholder="rollenlaenge", style={"width": "100%"})]),
+                                                    html.Div([html.Label("Sprache"), dcc.Dropdown(id="technical-label-language", options=LANGUAGE_CODE_OPTIONS, clearable=False)]),
+                                                    html.Div([html.Label("Label"), dcc.Input(id="technical-label-text", placeholder="Roll length", style={"width": "100%"})]),
+                                                    html.Div([html.Label("Aktion"), html.Button("Label speichern", id="technical-label-save-button")]),
+                                                ],
+                                                className="form-grid translation-technical-form-grid",
+                                            ),
+                                            grid("technical-label-translations-grid", TECHNICAL_ATTRIBUTE_LABEL_TRANSLATION_COLUMNS, height="220px", row_selection="single"),
+                                        ],
+                                        className="panel",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.H4("Technische Attributwerte"),
+                                            html.Div(
+                                                [
+                                                    dcc.Input(id="technical-value-translation-id", type="number", style={"display": "none"}),
+                                                    html.Div([html.Label("Technikwert-ID"), dcc.Input(id="technical-value-attribute-id", type="number", placeholder="Attribut-ID", style={"width": "100%"})]),
+                                                    html.Div([html.Label("Sprache"), dcc.Dropdown(id="technical-value-language", options=LANGUAGE_CODE_OPTIONS, clearable=False)]),
+                                                    html.Div([html.Label("Übersetzter Wert"), dcc.Input(id="technical-value-text", placeholder="yellow / drawstring", style={"width": "100%"})]),
+                                                    html.Div([html.Label("Aktion"), html.Button("Wert speichern", id="technical-value-save-button")]),
+                                                ],
+                                                className="form-grid translation-technical-form-grid",
+                                            ),
+                                            grid("technical-value-translations-grid", TECHNICAL_ATTRIBUTE_VALUE_TRANSLATION_COLUMNS, height="260px", row_selection="single"),
+                                        ],
+                                        className="panel",
+                                    ),
                                 ],
-                                className="detail-columns",
+                                className="translation-overview-grid",
                             )
                         ],
                     ),
@@ -6078,7 +6910,7 @@ def create_dash_app() -> Dash:
                                             html.Div([html.Label("Status"), dcc.Dropdown(id="dedupe-status-filter", options=[{"label": label, "value": label} for label in ["open", "reviewed", "merged", "ignored", "conflict", "error"]], placeholder="Alle")]),
                                             html.Div([html.Label("Min. Confidence"), dcc.Dropdown(id="dedupe-confidence-filter", options=[{"label": "Alle", "value": ""}, {"label": ">= 90 % sicher", "value": "90"}, {"label": ">= 70 % mittel", "value": "70"}, {"label": ">= 1 % alle", "value": "1"}], value="1", clearable=False)]),
                                             html.Div([html.Label("Quelle"), dcc.Input(id="dedupe-source-filter", placeholder="rule, import, TintoLove ...", style={"width": "100%"})]),
-                                            html.Div([html.Label("Suche"), dcc.Input(id="dedupe-query-filter", placeholder="Produktname, SKU, Family Key", style={"width": "100%"})]),
+                                            html.Div([html.Label("Suche"), dcc.Input(id="dedupe-query-filter", placeholder="Produktname oder SKU", style={"width": "100%"})]),
                                         ],
                                         className="form-grid",
                                     ),
@@ -6245,6 +7077,89 @@ def create_dash_app() -> Dash:
                                         className="detail-columns",
                                     ),
                                 ]
+                            )
+                        ],
+                    ),
+                    dcc.Tab(
+                        value="calculation",
+                        label="Kalkulation",
+                        style=HIDDEN_TAB_STYLE,
+                        selected_style=HIDDEN_TAB_STYLE,
+                        children=[
+                            html.Div(
+                                [
+                                    html.H3("Kalkulation"),
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                [
+                                                    html.H4("Währungen"),
+                                                    html.Div(
+                                                        [
+                                                            dcc.Input(id="currency-rate-id", type="number", style={"display": "none"}),
+                                                            dcc.Input(id="currency-source", placeholder="Von, z. B. EUR"),
+                                                            dcc.Input(id="currency-target", placeholder="Nach, z. B. CHF", value="CHF"),
+                                                            dcc.Input(id="currency-effective-rate", type="number", placeholder="Effektiver Kurs"),
+                                                            dcc.Input(id="currency-markup-percent", type="number", placeholder="Währungs-Aufschlag %", value=0),
+                                                            dcc.Input(id="currency-used-rate", type="number", placeholder="Verwendeter Kurs"),
+                                                            dcc.Input(id="currency-rate-date", placeholder="Kursdatum YYYY-MM-DD"),
+                                                            dcc.Dropdown(
+                                                                id="currency-status",
+                                                                options=[{"label": value, "value": value} for value in ["active", "inactive", "archived"]],
+                                                                value="active",
+                                                                clearable=False,
+                                                            ),
+                                                            html.Button("Neue Währung", id="currency-new-button"),
+                                                            html.Button("Währung speichern", id="currency-save-button"),
+                                                        ],
+                                                        className="form-grid",
+                                                    ),
+                                                    grid("currency-rates-grid", CURRENCY_RATE_COLUMNS, height="260px", row_selection="single"),
+                                                ],
+                                                className="panel",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.H4("Zuschläge"),
+                                                    html.Div(
+                                                        [
+                                                            dcc.Input(id="surcharge-id", type="number", style={"display": "none"}),
+                                                            dcc.Input(id="surcharge-code", placeholder="Code, z. B. transport_usa"),
+                                                            dcc.Input(id="surcharge-name", placeholder="Name"),
+                                                            dcc.Dropdown(
+                                                                id="surcharge-type",
+                                                                options=[{"label": value, "value": value} for value in ["transport", "debtor_risk", "customs", "handling"]],
+                                                                value="transport",
+                                                                clearable=False,
+                                                            ),
+                                                            dcc.Dropdown(
+                                                                id="surcharge-scope-type",
+                                                                options=[{"label": value, "value": value} for value in ["global", "supplier", "product_group", "country", "product", "variant"]],
+                                                                value="global",
+                                                                clearable=False,
+                                                            ),
+                                                            dcc.Input(id="surcharge-scope-value", placeholder="Wert, z. B. Tintolav, USA oder leer bei global"),
+                                                            dcc.Input(id="surcharge-percent", type="number", placeholder="Prozent"),
+                                                            dcc.Dropdown(
+                                                                id="surcharge-status",
+                                                                options=[{"label": value, "value": value} for value in ["active", "inactive", "archived"]],
+                                                                value="active",
+                                                                clearable=False,
+                                                            ),
+                                                            html.Button("Neuer Zuschlag", id="surcharge-new-button"),
+                                                            html.Button("Zuschlag speichern", id="surcharge-save-button"),
+                                                        ],
+                                                        className="form-grid",
+                                                    ),
+                                                    grid("cost-surcharges-grid", COST_SURCHARGE_COLUMNS, height="300px", row_selection="single"),
+                                                ],
+                                                className="panel",
+                                            ),
+                                        ],
+                                        className="detail-columns",
+                                    ),
+                                ],
+                                className="panel",
                             )
                         ],
                     ),
@@ -6521,17 +7436,73 @@ def register_callbacks(app: Dash) -> None:
 
     @app.callback(
         Output("global-process-status", "children"),
+        Output("process-status-ui-state", "data"),
+        Output("process-status-auto-collapse", "disabled"),
+        Output("process-status-auto-collapse", "n_intervals"),
         Input("global-process-status-poll", "n_intervals"),
+        Input({"type": "process-status-action", "action": "hide", "index": ALL}, "n_clicks"),
+        Input({"type": "process-status-action", "action": "details", "index": ALL}, "n_clicks"),
+        Input({"type": "process-status-action", "action": "log", "index": ALL}, "n_clicks"),
+        Input("process-status-auto-collapse", "n_intervals"),
+        State("process-status-ui-state", "data"),
     )
-    def refresh_global_process_status(_: int | None):
-        return render_global_process_status(get_process_status())
+    def refresh_global_process_status(
+        _poll: int | None,
+        _hide_clicks: list[int] | None,
+        _details_clicks: list[int] | None,
+        _log_clicks: list[int] | None,
+        auto_intervals: int | None,
+        ui_state: dict | None,
+    ):
+        status = get_process_status()
+        ui = dict(ui_state or {})
+        process_id = status.get("process_id")
+        state = status.get("status") or "ready"
+        last_seen_process_id = ui.get("last_seen_process_id")
+        if process_id and process_id != last_seen_process_id:
+            ui.update(
+                {
+                    "last_seen_process_id": process_id,
+                    "hidden_process_id": None,
+                    "expanded": state == "error",
+                    "log_visible": state in {"running", "error"},
+                    "auto_collapse_started_id": None,
+                    "auto_collapsed_process_id": None,
+                }
+            )
+        trigger = ctx.triggered_id
+        trigger_action = trigger.get("action") if isinstance(trigger, dict) else trigger
+        if trigger_action == "hide" and process_id:
+            ui["hidden_process_id"] = process_id
+        elif trigger_action == "details":
+            ui["expanded"] = not bool(ui.get("expanded"))
+        elif trigger_action == "log":
+            ui["log_visible"] = not bool(ui.get("log_visible"))
+        elif trigger == "process-status-auto-collapse" and process_id and state == "success" and auto_intervals:
+            ui["hidden_process_id"] = process_id
+            ui["auto_collapsed_process_id"] = process_id
+        if state == "running" and process_id:
+            ui["hidden_process_id"] = None
+        needs_auto_collapse = bool(
+            process_id
+            and state == "success"
+            and ui.get("hidden_process_id") != process_id
+            and ui.get("auto_collapsed_process_id") != process_id
+        )
+        reset_auto_interval = no_update
+        if needs_auto_collapse and ui.get("auto_collapse_started_id") != process_id:
+            ui["auto_collapse_started_id"] = process_id
+            reset_auto_interval = 0
+        if state != "success":
+            ui["auto_collapse_started_id"] = None
+        return ProcessStatusPanel(status, ui), ui, not needs_auto_collapse, reset_auto_interval
 
     @app.callback(
         Output("product-data-enrichment-open-button", "disabled"),
         Output("product-data-enrichment-preview-button", "disabled"),
         Output("product-data-enrichment-apply-selected-button", "disabled"),
         Output("product-data-enrichment-apply-all-button", "disabled"),
-        Output("product-asset-enrichment-run-button", "disabled"),
+        Output("product-asset-enrichment-direct-button", "disabled"),
         Output("product-final-url-description-run-button", "disabled"),
         Output("product-text-preview-button", "disabled"),
         Output("product-text-apply-selected-button", "disabled"),
@@ -6641,6 +7612,7 @@ def register_callbacks(app: Dash) -> None:
         Input("nav-rules", "n_clicks"),
         Input("nav-dedupe", "n_clicks"),
         Input("nav-compliance-swiss", "n_clicks"),
+        Input("nav-calculation", "n_clicks"),
         Input("nav-medusa", "n_clicks"),
         prevent_initial_call=True,
     )
@@ -6661,6 +7633,7 @@ def register_callbacks(app: Dash) -> None:
         ______________: int | None,
         _______________: int | None,
         ________________: int | None,
+        _________________: int | None,
     ) -> str:
         target = {
             "nav-dashboard": "dashboard",
@@ -6673,11 +7646,12 @@ def register_callbacks(app: Dash) -> None:
             "nav-assets": "assets",
             "nav-jobs": "jobs",
             "nav-attributes": "attributes",
-            "nav-families": "families",
+            "nav-families": "products",
             "nav-translations": "translations",
             "nav-rules": "rules",
             "nav-dedupe": "dedupe",
             "nav-compliance-swiss": "compliance-swiss",
+            "nav-calculation": "calculation",
             "nav-medusa": "medusa",
         }
         return target.get(ctx.triggered_id, "dashboard")
@@ -7082,11 +8056,31 @@ def register_callbacks(app: Dash) -> None:
         Output("nav-rules", "className"),
         Output("nav-dedupe", "className"),
         Output("nav-compliance-swiss", "className"),
+        Output("nav-calculation", "className"),
+        Output("nav-medusa", "className"),
         Input("main-tabs", "value"),
     )
     def update_sidebar_classes(active_tab: str | None):
         active = active_tab or "dashboard"
-        tabs = ["dashboard", "products", "chemistry", "variants", "categories", "sales-channels", "channel-categories", "assets", "jobs", "attributes", "families", "translations", "rules", "dedupe", "compliance-swiss"]
+        tabs = [
+            "dashboard",
+            "products",
+            "chemistry",
+            "variants",
+            "categories",
+            "sales-channels",
+            "channel-categories",
+            "assets",
+            "jobs",
+            "attributes",
+            "families",
+            "translations",
+            "rules",
+            "dedupe",
+            "compliance-swiss",
+            "calculation",
+            "medusa",
+        ]
         return tuple(
             "sidebar-nav-button sidebar-nav-button-active" if tab == active else "sidebar-nav-button"
             for tab in tabs
@@ -7322,7 +8316,9 @@ def register_callbacks(app: Dash) -> None:
         State("selected-product-ids", "data"),
         State("product-data-enrichment-fields", "value"),
         State("product-data-enrichment-sources", "value"),
+        State("product-data-enrichment-target-languages", "value"),
         State("product-data-enrichment-overwrite", "value"),
+        State("product-data-enrichment-text-quality", "value"),
         prevent_initial_call=True,
     )
     @_with_session
@@ -7332,43 +8328,121 @@ def register_callbacks(app: Dash) -> None:
         selected_product_ids: list[int] | None,
         fields: list[str] | None,
         sources: list[str] | None,
+        target_languages: list[str] | None,
         overwrite_existing: bool | None,
+        text_quality_options: list[str] | None,
     ):
         if not n_clicks:
             return no_update, no_update, no_update, no_update
         product_ids = [int(product_id) for product_id in (selected_product_ids or [])]
         if not product_ids:
             return {}, [], "Keine Produkte ausgewählt.", ""
+        target_locales = _normalize_selected_locales(target_languages)
+        if not target_locales:
+            return {}, [], "Bitte mindestens eine Zielsprache auswählen.", ""
         try:
             with process_guard(
                 "Fehlende Produktdaten anreichern",
-                options={"dry_run": True, "overwrite": bool(overwrite_existing), "fields": fields or [], "sources": sources or []},
+                options={
+                    "dry_run": True,
+                    "overwrite": bool(overwrite_existing),
+                    "fields": fields or [],
+                    "sources": sources or [],
+                    "target_locales": target_locales,
+                    "text_quality": text_quality_options or [],
+                },
                 selection={"products": len(product_ids), "product_ids": product_ids[:20]},
-                progress_total=len(product_ids),
+                progress_total=len(product_ids) * len(target_locales),
             ):
-                result = preview_product_data_enrichment(
-                    session,
-                    product_ids,
-                    fields=fields or [],
-                    sources=sources or [],
-                    overwrite_existing=bool(overwrite_existing),
-                )
+                locale_results = [
+                    preview_product_data_enrichment(
+                        session,
+                        product_ids,
+                        fields=fields or [],
+                        sources=sources or [],
+                        text_quality_options=text_quality_options or [],
+                        overwrite_existing=bool(overwrite_existing),
+                        target_locale=target_locale,
+                    )
+                    for target_locale in target_locales
+                ]
+                result = _combine_product_data_enrichment_results(locale_results, target_locales)
                 suggestions = _product_enrichment_suggestion_rows(result)
                 warnings = _product_enrichment_warnings(result)
                 counters = {
-                    "products_checked": int(result.get("products_checked", 0) or 0),
+                    "products_checked": len(product_ids),
+                    "target_locales": len(target_locales),
                     "products_with_suggestions": int(result.get("products_with_suggestions", 0) or 0),
                     "field_suggestions": len(suggestions),
                 }
                 status = (
-                    f"{result.get('products_checked', 0)} Produkte geprüft · "
-                    f"{result.get('products_with_suggestions', 0)} Produkte mit Vorschlägen · "
+                    f"{len(product_ids)} Produkte · {len(target_locales)} Zielsprachen geprüft · "
+                    f"{result.get('products_with_suggestions', 0)} Produkt-Sprach-Kombinationen mit Vorschlägen · "
                     f"{len(suggestions)} Feldvorschläge."
                 )
                 finish_process(status="success", message=status, counters=counters)
                 return result, suggestions, status, warnings
         except ProcessAlreadyRunning as exc:
             return {}, [], str(exc), ""
+
+    @app.callback(
+        Output("product-data-enrichment-selected-meta", "children"),
+        Output("product-data-enrichment-selected-current", "value"),
+        Output("product-data-enrichment-selected-original", "value"),
+        Output("product-data-enrichment-selected-suggestion-value", "value"),
+        Input("product-data-enrichment-suggestions-grid", "selectedRows"),
+    )
+    def render_product_data_enrichment_selected_suggestion(selected_rows: list[dict] | None):
+        if not selected_rows:
+            return "Kein Vorschlag ausgewählt.", "", "", ""
+        row = selected_rows[0]
+        meta = (
+            f"Produkt {row.get('product_id') or '-'} · {row.get('sku') or '-'} · "
+            f"Feld: {row.get('field_name') or '-'} · Ziel: {row.get('target_locale') or '-'} · "
+            f"Quelle: {row.get('source_url') or row.get('source_domain') or '-'}"
+        )
+        return (
+            meta,
+            str(row.get("current_value") or ""),
+            str(row.get("original_value") or ""),
+            str(row.get("suggested_value") or ""),
+        )
+
+    @app.callback(
+        Output("product-data-enrichment-suggestions-grid", "rowData", allow_duplicate=True),
+        Output("product-data-enrichment-suggestions-grid", "selectedRows", allow_duplicate=True),
+        Output("product-data-enrichment-status", "children", allow_duplicate=True),
+        Input("product-data-enrichment-update-selected-suggestion-button", "n_clicks"),
+        State("product-data-enrichment-suggestions-grid", "rowData"),
+        State("product-data-enrichment-suggestions-grid", "selectedRows"),
+        State("product-data-enrichment-selected-suggestion-value", "value"),
+        prevent_initial_call=True,
+    )
+    def update_product_data_enrichment_selected_suggestion(
+        n_clicks: int | None,
+        rows: list[dict] | None,
+        selected_rows: list[dict] | None,
+        suggested_value: str | None,
+    ):
+        if not n_clicks:
+            return no_update, no_update, no_update
+        if not selected_rows:
+            return no_update, no_update, "Kein Vorschlag ausgewählt."
+        selected = dict(selected_rows[0])
+        row_id = selected.get("_row_id")
+        if not row_id:
+            return no_update, no_update, "Ausgewählter Vorschlag hat keine interne Zeilen-ID."
+        updated_rows = []
+        updated_selected = []
+        for row in rows or []:
+            next_row = dict(row)
+            if next_row.get("_row_id") == row_id:
+                next_row["suggested_value"] = suggested_value or ""
+                updated_selected = [next_row]
+            updated_rows.append(next_row)
+        if not updated_selected:
+            return no_update, no_update, "Vorschlag konnte in der Tabelle nicht gefunden werden."
+        return updated_rows, updated_selected, "Geänderter Vorschlag wurde in die Tabelle übernommen."
 
     @app.callback(
         Output("product-data-enrichment-status", "children", allow_duplicate=True),
@@ -7539,10 +8613,9 @@ def register_callbacks(app: Dash) -> None:
             return str(exc), no_update, no_update
 
     @app.callback(
-        Output("product-asset-enrichment-status", "children"),
         Output("flash-message", "children", allow_duplicate=True),
         Output("refresh-token", "data", allow_duplicate=True),
-        Input("product-asset-enrichment-run-button", "n_clicks"),
+        Input("product-asset-enrichment-direct-button", "n_clicks"),
         State("selected-product-ids", "data"),
         State("refresh-token", "data"),
         prevent_initial_call=True,
@@ -7550,16 +8623,16 @@ def register_callbacks(app: Dash) -> None:
     @_with_session
     def run_product_asset_enrichment_callback(
         session: Session,
-        n_clicks: int | None,
+        direct_clicks: int | None,
         selected_product_ids: list[int] | None,
         refresh_token: int | None,
     ):
-        if not n_clicks:
-            return no_update, no_update, no_update
+        if not direct_clicks:
+            return no_update, no_update
         product_ids = [int(product_id) for product_id in (selected_product_ids or [])]
         if not product_ids:
             message = "Bitte zuerst mindestens ein Produkt auswählen."
-            return message, message, no_update
+            return message, no_update
         try:
             with process_guard(
                 "Fehlende Produkt-Assets anreichern",
@@ -7574,11 +8647,11 @@ def register_callbacks(app: Dash) -> None:
                 )
         except ProcessAlreadyRunning as exc:
             message = str(exc)
-            return message, message, no_update
+            return message, no_update
         except Exception as exc:
             message = f"Produkt-Asset-Anreicherung fehlgeschlagen: {exc}"
             fail_process(message)
-            return message, message, no_update
+            return message, no_update
         summary = html.Div(
             [
                 html.Div(
@@ -7600,7 +8673,7 @@ def register_callbacks(app: Dash) -> None:
                 "errors": int(result.get("error_count", 0) or 0),
             },
         )
-        return summary, "Produkt-Asset-Anreicherung abgeschlossen.", (refresh_token or 0) + 1
+        return summary, (refresh_token or 0) + 1
 
     @app.callback(
         Output("product-final-url-description-status", "children"),
@@ -7896,6 +8969,112 @@ def register_callbacks(app: Dash) -> None:
         return _channel_bulk_actions_style(product_count > 0), summary
 
     @app.callback(
+        Output("products-selection-delete-confirm", "displayed"),
+        Output("products-selection-delete-confirm", "message"),
+        Input("product-selection-delete-button", "n_clicks"),
+        State("selected-product-ids", "data"),
+        State("selected-variant-ids", "data"),
+        State("products-grid", "selectedRows"),
+        State("variants-grid", "selectedRows"),
+        State("product-detail-variants", "selectedRows"),
+        prevent_initial_call=True,
+    )
+    def ask_selection_delete_confirm(
+        n_clicks: int | None,
+        selected_product_ids: list[int] | None,
+        selected_variant_ids: list[int] | None,
+        selected_product_rows: list[dict] | None,
+        selected_variant_rows: list[dict] | None,
+        selected_detail_variant_rows: list[dict] | None,
+    ):
+        if not n_clicks:
+            return False, no_update
+        product_ids = _selected_ids_from_rows_or_store(selected_product_rows, selected_product_ids)
+        variant_ids = _selected_variant_ids_for_delete(selected_variant_rows, selected_detail_variant_rows, selected_variant_ids)
+        product_count = len(product_ids)
+        variant_count = len(variant_ids)
+        if product_count == 0 and variant_count == 0:
+            return False, "Bitte zuerst ein oder mehrere Produkte oder Varianten markieren."
+        product_preview = ", ".join(str(product_id) for product_id in product_ids[:20])
+        if len(product_ids) > 20:
+            product_preview = f"{product_preview}, ..."
+        return True, (
+            f"{product_count} Produkt(e) und {variant_count} direkt markierte Variante(n) endgültig löschen? "
+            f"Produkt-IDs: {product_preview or '-'}; "
+            "Produkte, zugehörige Varianten, Assets, Übersetzungen, Preise, Kanal-/Medusa-Zuordnungen "
+            "und weitere abhängige Daten werden dauerhaft entfernt."
+        )
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Output("products-grid", "selectedRows", allow_duplicate=True),
+        Output("variants-grid", "selectedRows", allow_duplicate=True),
+        Output("last-product-clicked-id", "data", allow_duplicate=True),
+        Output("selected-product-ids", "data", allow_duplicate=True),
+        Output("selected-variant-ids", "data", allow_duplicate=True),
+        Input("products-selection-delete-confirm", "submit_n_clicks"),
+        State("selected-product-ids", "data"),
+        State("selected-variant-ids", "data"),
+        State("products-grid", "selectedRows"),
+        State("variants-grid", "selectedRows"),
+        State("product-detail-variants", "selectedRows"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def hard_delete_selection_callback(
+        session: Session,
+        submit_n_clicks: int | None,
+        selected_product_ids: list[int] | None,
+        selected_variant_ids: list[int] | None,
+        selected_product_rows: list[dict] | None,
+        selected_variant_rows: list[dict] | None,
+        selected_detail_variant_rows: list[dict] | None,
+        refresh_token: int | None,
+    ):
+        if not submit_n_clicks:
+            return no_update, no_update, no_update, no_update, no_update, no_update, no_update
+        product_ids = _selected_ids_from_rows_or_store(selected_product_rows, selected_product_ids)
+        product_id_set = set(product_ids)
+        variant_ids = []
+        selected_variant_id_set = set(_selected_variant_ids_for_delete(selected_variant_rows, selected_detail_variant_rows, selected_variant_ids))
+        for variant_id in selected_variant_id_set:
+            variant = session.get(ProductVariant, int(variant_id))
+            if variant is not None and int(variant.product_id) not in product_id_set:
+                variant_ids.append(int(variant_id))
+        if not product_ids and not variant_ids:
+            return "Keine Produkte oder Varianten zum Löschen markiert.", no_update, no_update, no_update, no_update, [], []
+        products_deleted = 0
+        product_variants_deleted = 0
+        assets_deleted = 0
+        translations_deleted = 0
+        price_tiers_deleted = 0
+        try:
+            for product_id in product_ids:
+                product = session.get(Product, int(product_id))
+                if product is None:
+                    continue
+                result = hard_delete_product(session, int(product_id), str(product.id))
+                products_deleted += 1
+                product_variants_deleted += int(result.get("variants_deleted") or 0)
+                assets_deleted += int(result.get("assets_deleted") or 0)
+                translations_deleted += int(result.get("translations_deleted") or 0)
+                price_tiers_deleted += int(result.get("price_tiers_deleted") or 0)
+            variant_result = hard_delete_variants(session, variant_ids) if variant_ids else {}
+        except ValueError as exc:
+            return str(exc), no_update, no_update, no_update, no_update, [], []
+        variants_deleted = product_variants_deleted + int(variant_result.get("variants_deleted") or 0)
+        assets_deleted += int(variant_result.get("assets_deleted") or 0)
+        translations_deleted += int(variant_result.get("translations_deleted") or 0)
+        price_tiers_deleted += int(variant_result.get("price_tiers_deleted") or 0)
+        message = (
+            f"{products_deleted} Produkt(e) und {variants_deleted} Variante(n) endgültig gelöscht. "
+            f"Assets: {assets_deleted}, Übersetzungen: {translations_deleted}, Staffelpreise: {price_tiers_deleted}."
+        )
+        return message, (refresh_token or 0) + 1, [], [], None, [], []
+
+    @app.callback(
         Output("variants-grid", "selectedRows", allow_duplicate=True),
         Input("selected-product-ids", "data"),
         Input("product-channel-include-variants", "value"),
@@ -8045,6 +9224,9 @@ def register_callbacks(app: Dash) -> None:
         State("variant-bulk-edit-barcode", "value"),
         State("variant-bulk-edit-option-name", "value"),
         State("variant-bulk-edit-option-value", "value"),
+        State("variant-bulk-edit-sales-unit", "value"),
+        State("variant-bulk-edit-pack-quantity", "value"),
+        State("variant-bulk-edit-pack-unit", "value"),
         State("variant-bulk-edit-packaging", "value"),
         State("variant-bulk-edit-options", "value"),
         prevent_initial_call=True,
@@ -8064,6 +9246,9 @@ def register_callbacks(app: Dash) -> None:
         barcode: str | None,
         option_name: str | None,
         option_value: str | None,
+        sales_unit: str | None,
+        pack_quantity: float | None,
+        pack_unit: str | None,
         packaging: str | None,
         options: list[str] | None,
     ):
@@ -8073,7 +9258,22 @@ def register_callbacks(app: Dash) -> None:
             result = bulk_update_variants(
                 session,
                 (context or {}).get("variant_ids") or [],
-                _variant_bulk_updates(fields, status, price, currency, cost_price, cost_currency, stock_qty, barcode, option_name, option_value, packaging),
+                _variant_bulk_updates(
+                    fields,
+                    status,
+                    price,
+                    currency,
+                    cost_price,
+                    cost_currency,
+                    stock_qty,
+                    barcode,
+                    option_name,
+                    option_value,
+                    sales_unit,
+                    _float_or_none(pack_quantity),
+                    pack_unit,
+                    packaging,
+                ),
                 apply=False,
                 only_empty="only_empty" in (options or []),
             )
@@ -8168,6 +9368,9 @@ def register_callbacks(app: Dash) -> None:
         State("variant-bulk-edit-barcode", "value"),
         State("variant-bulk-edit-option-name", "value"),
         State("variant-bulk-edit-option-value", "value"),
+        State("variant-bulk-edit-sales-unit", "value"),
+        State("variant-bulk-edit-pack-quantity", "value"),
+        State("variant-bulk-edit-pack-unit", "value"),
         State("variant-bulk-edit-packaging", "value"),
         State("variant-bulk-edit-options", "value"),
         prevent_initial_call=True,
@@ -8188,6 +9391,9 @@ def register_callbacks(app: Dash) -> None:
         barcode: str | None,
         option_name: str | None,
         option_value: str | None,
+        sales_unit: str | None,
+        pack_quantity: float | None,
+        pack_unit: str | None,
         packaging: str | None,
         options: list[str] | None,
     ):
@@ -8197,7 +9403,22 @@ def register_callbacks(app: Dash) -> None:
             result = bulk_update_variants(
                 session,
                 (context or {}).get("variant_ids") or [],
-                _variant_bulk_updates(fields, status, price, currency, cost_price, cost_currency, stock_qty, barcode, option_name, option_value, packaging),
+                _variant_bulk_updates(
+                    fields,
+                    status,
+                    price,
+                    currency,
+                    cost_price,
+                    cost_currency,
+                    stock_qty,
+                    barcode,
+                    option_name,
+                    option_value,
+                    sales_unit,
+                    _float_or_none(pack_quantity),
+                    pack_unit,
+                    packaging,
+                ),
                 apply=True,
                 only_empty="only_empty" in (options or []),
             )
@@ -8436,6 +9657,7 @@ def register_callbacks(app: Dash) -> None:
         Output("translation-source-language", "options"),
         Output("translation-target-languages", "options"),
         Output("translation-prompt-language", "options"),
+        Output("product-data-enrichment-target-languages", "options"),
         Output("product-text-source-language", "options"),
         Output("product-text-target-languages", "options"),
         Input("snapshot-store", "data"),
@@ -8443,7 +9665,7 @@ def register_callbacks(app: Dash) -> None:
     def load_translation_language_options(snapshot: dict | None):
         rows = (snapshot or {}).get("languages", [])
         options = [{"label": f"{row.get('name')} ({row.get('code')})", "value": row.get("code")} for row in rows if row.get("enabled")]
-        return options, options, options, options, options
+        return options, options, options, options, options, options
 
     @app.callback(
         Output("translation-bulk-modal", "style"),
@@ -8689,15 +9911,17 @@ def register_callbacks(app: Dash) -> None:
     @app.callback(
         Output("snapshot-store", "data"),
         Input("refresh-token", "data"),
-        Input("product-list-status-filter", "value"),
-        Input("variant-list-status-filter", "value"),
+        Input("main-tabs", "value"),
     )
     @_with_session
-    def load_snapshot(session: Session, _: int, product_archive_filter: str | None, variant_archive_filter: str | None) -> dict:
+    def load_snapshot(
+        session: Session,
+        _: int,
+        active_tab: str | None,
+    ) -> dict:
         return app_snapshot(
             session,
-            product_archive_filter=product_archive_filter or "active",
-            variant_archive_filter=variant_archive_filter or "active",
+            active_tab=active_tab or "dashboard",
         )
 
     @app.callback(
@@ -8714,10 +9938,12 @@ def register_callbacks(app: Dash) -> None:
         Output("languages-grid", "rowData"),
         Output("translations-grid", "rowData"),
         Output("variant-translations-grid", "rowData"),
+        Output("technical-label-translations-grid", "rowData"),
+        Output("technical-value-translations-grid", "rowData"),
         Output("rules-grid", "rowData"),
         Output("sales-channels-grid", "rowData"),
         Output("channel-categories-grid", "rowData"),
-        Output("product-brand", "options"),
+        Output("product-brand-options", "children"),
         Output("chemistry-product-brand", "options"),
         Output("categories-sales-channel-code", "options"),
         Output("product-category-channel-code", "options"),
@@ -8728,17 +9954,27 @@ def register_callbacks(app: Dash) -> None:
         Output("product-channel-mapping-sales-channel-id", "options"),
         Output("medusa-category-sales-channel-id", "options"),
         Output("medusa-position-sales-channel-id", "options"),
+        Output("price-lists-grid", "rowData"),
+        Output("price-list-sales-channel-id", "options"),
+        Output("tier-price-list-id", "options"),
+        Output("currency-rates-grid", "rowData"),
+        Output("cost-surcharges-grid", "rowData"),
         Input("snapshot-store", "data"),
+        Input("product-table-focus-id", "data"),
     )
-    def apply_snapshot(snapshot: dict | None):
+    def apply_snapshot(snapshot: dict | None, product_table_focus_id: int | None):
         snapshot = snapshot or {"counts": {}}
         counts = snapshot.get("counts", {})
+        products = list(snapshot.get("products", []) or [])
+        if product_table_focus_id:
+            focused_product_id = int(product_table_focus_id)
+            products.sort(key=lambda row: 0 if int(row.get("id") or 0) == focused_product_id else 1)
         return (
             counts.get("products", 0),
             counts.get("variants", 0),
             counts.get("assets", 0),
             counts.get("import_jobs", 0),
-            snapshot.get("products", []),
+            products,
             snapshot.get("assets", []),
             snapshot.get("jobs", []),
             snapshot.get("jobs", []),
@@ -8747,11 +9983,13 @@ def register_callbacks(app: Dash) -> None:
             snapshot.get("languages", []),
             snapshot.get("translations", []),
             snapshot.get("variant_translations", []),
+            snapshot.get("technical_attribute_label_translations", []),
+            snapshot.get("technical_attribute_value_translations", []),
             snapshot.get("rules", []),
             snapshot.get("sales_channels", []),
             snapshot.get("channel_categories", []),
+            [html.Option(value=item.get("value")) for item in snapshot.get("brand_options", []) if item.get("value")],
             snapshot.get("brand_options", []),
-            snapshot.get("brand_options", []),
             snapshot.get("sales_channel_code_options", []),
             snapshot.get("sales_channel_code_options", []),
             snapshot.get("sales_channel_code_options", []),
@@ -8761,6 +9999,11 @@ def register_callbacks(app: Dash) -> None:
             snapshot.get("sales_channel_options", []),
             snapshot.get("sales_channel_options", []),
             snapshot.get("sales_channel_options", []),
+            snapshot.get("price_lists", []),
+            [{"label": "Alle Kanäle", "value": ""}, *snapshot.get("sales_channel_options", [])],
+            [{"label": "Basispreis", "value": ""}, *snapshot.get("price_list_options", [])],
+            snapshot.get("currency_rates", []),
+            snapshot.get("cost_surcharges", []),
         )
 
     @app.callback(
@@ -9480,6 +10723,32 @@ def register_callbacks(app: Dash) -> None:
         return message, (refresh_token or 0) + 1, [], []
 
     @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("assets-bulk-language-button", "n_clicks"),
+        State("selected-asset-ids", "data"),
+        State("assets-bulk-language-code", "value"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def set_selected_assets_language_callback(
+        session: Session,
+        _: int | None,
+        selected_ids: list[int] | None,
+        language_code: str | None,
+        refresh_token: int,
+    ):
+        if not selected_ids:
+            return "Keine Assets ausgewählt.", no_update
+        updated = 0
+        for asset_id in selected_ids:
+            update_asset_metadata(session, int(asset_id), language_code=(language_code or "").strip() or None)
+            updated += 1
+        label = (language_code or "").strip() or "leer"
+        return f"{updated} Asset(s) auf Sprache {label} gesetzt.", (refresh_token or 0) + 1
+
+    @app.callback(
         Output("main-tabs", "value", allow_duplicate=True),
         Output("last-product-clicked-id", "data", allow_duplicate=True),
         Output("last-product-click-event", "data", allow_duplicate=True),
@@ -9570,6 +10839,35 @@ def register_callbacks(app: Dash) -> None:
         return "variants", int(product_id), f"Zeige Varianten für Produkt {label}."
 
     @app.callback(
+        Output("main-tabs", "value", allow_duplicate=True),
+        Output("last-product-clicked-id", "data", allow_duplicate=True),
+        Output("product-table-focus-id", "data", allow_duplicate=True),
+        Output("flash-message", "children", allow_duplicate=True),
+        Input("variants-grid", "cellClicked"),
+        State("variants-grid", "virtualRowData"),
+        State("variants-grid", "rowData"),
+        prevent_initial_call=True,
+    )
+    def jump_from_variant_to_product(
+        cell_event: dict | None,
+        virtual_rows: list[dict] | None,
+        rows: list[dict] | None,
+    ):
+        if not cell_event:
+            return no_update, no_update, no_update, no_update
+        col_id = cell_event.get("colId") or ""
+        row_index = cell_event.get("rowIndex")
+        row_list = virtual_rows if virtual_rows is not None else (rows or [])
+        row = cell_event.get("data") or {}
+        if not row and isinstance(row_index, int) and 0 <= row_index < len(row_list):
+            row = row_list[row_index]
+        product_id = row.get("product_id")
+        if col_id != "product_nav" or not product_id:
+            return no_update, no_update, no_update, no_update
+        label = row.get("product_sku") or product_id
+        return "products", int(product_id), int(product_id), f"Zeige Produkt {label}."
+
+    @app.callback(
         Output("product-focus-id", "data", allow_duplicate=True),
         Output("products-grid", "selectedRows", allow_duplicate=True),
         Input("products-grid", "cellClicked"),
@@ -9597,6 +10895,18 @@ def register_callbacks(app: Dash) -> None:
         if not row.get("id"):
             return no_update, no_update
         return int(row["id"]), [row]
+
+    @app.callback(
+        Output("products-grid", "selectedRows", allow_duplicate=True),
+        Input("product-table-focus-id", "data"),
+        Input("products-grid", "rowData"),
+        prevent_initial_call=True,
+    )
+    def select_focused_product(product_id: int | None, rows: list[dict] | None):
+        if not product_id:
+            return no_update
+        row = next((item for item in (rows or []) if int(item.get("id") or 0) == int(product_id)), None)
+        return [row] if row else no_update
 
     @app.callback(
         Output("variant-focus-product-id", "data", allow_duplicate=True),
@@ -9863,6 +11173,7 @@ def register_callbacks(app: Dash) -> None:
         Output("product-detail-variant-category-mappings", "rowData"),
         Output("product-detail-asset-links", "children"),
         Output("product-detail-asset-preview", "children"),
+        Output("product-detail-original-values", "data"),
         Input("last-product-clicked-id", "data"),
         Input("last-product-click-event", "data"),
         Input("selected-product-ids", "data"),
@@ -9884,23 +11195,33 @@ def register_callbacks(app: Dash) -> None:
     ):
         product_id = None
         debug_parts = []
-        if last_clicked_id is not None:
+        triggered_props = set(ctx.triggered_prop_ids)
+        if "selected-product-ids.data" in triggered_props and selected_product_ids:
+            debug_parts.append(f"selected={selected_product_ids[:3]}")
+            product_id = int(selected_product_ids[0])
+        if product_id is None and "active-product-row.data" in triggered_props and active_row and active_row.get("id") is not None:
+            debug_parts.append(f"activeRow id={active_row.get('id')}")
+            product_id = int(active_row["id"])
+        if product_id is None and {"last-product-clicked-id.data", "last-product-click-event.data"} & triggered_props and last_clicked_id is not None:
             debug_parts.append(f"clicked={last_clicked_id}")
             product_id = int(last_clicked_id)
+        if product_id is None and current_product_id:
+            debug_parts.append(f"current id={current_product_id}")
+            product_id = current_product_id
         if product_id is None and selected_product_ids:
             debug_parts.append(f"selected={selected_product_ids[:3]}")
             product_id = int(selected_product_ids[0])
         if product_id is None and active_row and active_row.get("id") is not None:
             debug_parts.append(f"activeRow id={active_row.get('id')}")
             product_id = int(active_row["id"])
-        if product_id is None and current_product_id:
-            debug_parts.append(f"current id={current_product_id}")
-            product_id = current_product_id
+        if product_id is None and last_clicked_id is not None:
+            debug_parts.append(f"clicked={last_clicked_id}")
+            product_id = int(last_clicked_id)
         if not product_id:
-            return None, None, None, None, "draft", "en", False, DEFAULT_CATEGORY_CHANNEL_CODE, None, None, None, None, "Kein Produkt gewählt.", [], [], [], [], [], [], [], [], [], "Keine Assets vorhanden.", "Keine Asset-Vorschau vorhanden."
+            return None, None, None, None, "draft", "en", False, DEFAULT_CATEGORY_CHANNEL_CODE, None, None, None, None, "Kein Produkt gewählt.", [], [], [], [], [], [], [], [], [], "Keine Assets vorhanden.", "Keine Asset-Vorschau vorhanden.", {}
         detail = get_product_detail(session, int(product_id), include_sdb=False)
         if detail is None:
-            return None, None, None, None, "draft", "en", False, DEFAULT_CATEGORY_CHANNEL_CODE, None, None, None, None, "Produkt nicht gefunden.", [], [], [], [], [], [], [], [], [], "Keine Assets vorhanden.", "Keine Asset-Vorschau vorhanden."
+            return None, None, None, None, "draft", "en", False, DEFAULT_CATEGORY_CHANNEL_CODE, None, None, None, None, "Produkt nicht gefunden.", [], [], [], [], [], [], [], [], [], "Keine Assets vorhanden.", "Keine Asset-Vorschau vorhanden.", {}
         asset_links = _render_asset_links(detail["assets"])
         asset_preview = _render_asset_preview(detail["assets"])
         category_summary = detail.get("category_assignments") or list_product_category_assignments(session, int(product_id))
@@ -9910,7 +11231,7 @@ def register_callbacks(app: Dash) -> None:
         ) or "-"
         summary = html.Div(
             [
-                html.Div(f"Family Key: {detail.get('family_key') or '-'}"),
+                html.Div(f"Produkt-SKU / Artikelfamilie: {detail.get('sku') or '-'}"),
                 html.Div(f"Originalsprache: {detail.get('source_language') or '-'}"),
                 html.Div(f"Handle: {detail['handle']}"),
                 html.Div(f"Medusa Product ID: {detail.get('medusa_id') or '-'}"),
@@ -9959,6 +11280,79 @@ def register_callbacks(app: Dash) -> None:
             detail.get("variant_category_mappings", []),
             asset_links,
             asset_preview,
+            _product_detail_original_values(detail),
+        )
+
+    @app.callback(
+        Output("product-detail-dirty-state", "children"),
+        Input("product-id", "value"),
+        Input("product-sku", "value"),
+        Input("product-title", "value"),
+        Input("product-brand", "value"),
+        Input("product-status", "value"),
+        Input("product-source-language", "value"),
+        Input("product-is-chemical", "value"),
+        Input("product-category-channel-code", "value"),
+        Input("product-short-description", "value"),
+        Input("product-description", "value"),
+        Input("product-source-url", "value"),
+        Input("product-source-url-final", "value"),
+        State("product-detail-original-values", "data"),
+    )
+    def render_product_detail_dirty_state(
+        product_id: int | None,
+        sku: str | None,
+        title: str | None,
+        brand_name: str | None,
+        status: str | None,
+        source_language: str | None,
+        is_chemical: bool | None,
+        category_channel_code: str | None,
+        short_description: str | None,
+        description: str | None,
+        source_url: str | None,
+        source_url_final: str | None,
+        original: dict | None,
+    ):
+        if not product_id or not original:
+            return ""
+
+        current = {
+            "sku": sku,
+            "title": title,
+            "brand": brand_name,
+            "status": status,
+            "source_language": source_language or "en",
+            "is_chemical": bool(is_chemical),
+            "category_channel_code": category_channel_code or DEFAULT_CATEGORY_CHANNEL_CODE,
+            "short_description": short_description,
+            "description": description,
+            "source_url": source_url,
+            "source_url_final": source_url_final,
+        }
+        labels = {
+            "sku": "Produkt-SKU",
+            "title": "Titel",
+            "brand": "Marke",
+            "status": "Status",
+            "source_language": "Sprache",
+            "is_chemical": "Chemie",
+            "category_channel_code": "Kategorie-Kanal",
+            "short_description": "Kurzbeschreibung",
+            "description": "Beschreibung",
+            "source_url": "Source URL",
+            "source_url_final": "Final URL",
+        }
+        dirty_fields = [
+            labels[field]
+            for field, value in current.items()
+            if str(value or "").strip() != str((original or {}).get(field) or "").strip()
+        ]
+        if not dirty_fields:
+            return ""
+        return html.Span(
+            f"Nicht gespeichert: {', '.join(dirty_fields)}. Bitte Produkt speichern.",
+            className="product-detail-dirty-message",
         )
 
     @app.callback(
@@ -12244,18 +13638,85 @@ def register_callbacks(app: Dash) -> None:
     ):
         if not selected_rows:
             return "Kein Asset ausgewählt.", no_update
+        if ctx.triggered_id == "asset-delete-button":
+            asset_ids = [int(row["id"]) for row in selected_rows if row.get("id") is not None]
+            if not asset_ids:
+                return "Kein Asset ausgewählt.", no_update
+            for asset_id in asset_ids:
+                delete_asset(session, asset_id)
+            return f"{len(asset_ids)} Asset(s) gelöscht.", (refresh_token or 0) + 1
         asset_id = selected_rows[0].get("id")
         if asset_id is None:
             return "Kein Asset ausgewählt.", no_update
-        if ctx.triggered_id == "asset-delete-button":
-            delete_asset(session, int(asset_id))
-            return f"Asset {asset_id} gelöscht.", (refresh_token or 0) + 1
         if ctx.triggered_id == "asset-move-up-button":
             move_asset(session, int(asset_id), "up")
             return f"Asset {asset_id} nach oben verschoben.", (refresh_token or 0) + 1
         if ctx.triggered_id == "asset-move-down-button":
             move_asset(session, int(asset_id), "down")
             return f"Asset {asset_id} nach unten verschoben.", (refresh_token or 0) + 1
+        return no_update, no_update
+
+    @app.callback(
+        Output("variant-detail-assets", "rowData"),
+        Output("variant-detail-asset-links", "children"),
+        Output("variant-detail-asset-preview", "children"),
+        Input("variants-grid", "selectedRows"),
+        Input("refresh-token", "data"),
+        State("variants-grid", "rowData"),
+    )
+    @_with_session
+    def load_variant_assets_callback(
+        session: Session,
+        selected_rows: list[dict] | None,
+        _refresh_token: int | None,
+        row_data: list[dict] | None,
+    ):
+        if not selected_rows:
+            return [], "Keine Assets vorhanden.", "Keine Asset-Vorschau vorhanden."
+        variant_id = selected_rows[0].get("id")
+        if variant_id is None:
+            return [], "Keine Assets vorhanden.", "Keine Asset-Vorschau vorhanden."
+        variant_row = next((row for row in row_data or [] if row.get("id") == variant_id), selected_rows[0])
+        rows = _variant_asset_rows(session, int(variant_id), variant_row)
+        return rows, _render_asset_links(rows), _render_asset_preview(rows)
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("variant-asset-move-up-button", "n_clicks"),
+        Input("variant-asset-move-down-button", "n_clicks"),
+        Input("variant-asset-delete-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("variant-detail-assets", "selectedRows"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def manage_variant_asset_callback(
+        session: Session,
+        _: int | None,
+        __: int | None,
+        ___: int | None,
+        refresh_token: int,
+        selected_rows: list[dict] | None,
+    ):
+        if not selected_rows:
+            return "Kein Varianten-Asset ausgewählt.", no_update
+        if ctx.triggered_id == "variant-asset-delete-button":
+            asset_ids = [int(row["id"]) for row in selected_rows if row.get("id") is not None]
+            if not asset_ids:
+                return "Kein Varianten-Asset ausgewählt.", no_update
+            for asset_id in asset_ids:
+                delete_asset(session, asset_id)
+            return f"{len(asset_ids)} Varianten-Asset(s) gelöscht.", (refresh_token or 0) + 1
+        asset_id = selected_rows[0].get("id")
+        if asset_id is None:
+            return "Kein Varianten-Asset ausgewählt.", no_update
+        if ctx.triggered_id == "variant-asset-move-up-button":
+            move_asset(session, int(asset_id), "up")
+            return f"Varianten-Asset {asset_id} nach oben verschoben.", (refresh_token or 0) + 1
+        if ctx.triggered_id == "variant-asset-move-down-button":
+            move_asset(session, int(asset_id), "down")
+            return f"Varianten-Asset {asset_id} nach unten verschoben.", (refresh_token or 0) + 1
         return no_update, no_update
 
     @app.callback(
@@ -12311,12 +13772,12 @@ def register_callbacks(app: Dash) -> None:
         short_description: str | None,
         description: str | None,
     ):
-        if not sku or not title:
-            return "SKU und Titel sind Pflicht.", no_update
+        if not title:
+            return "Titel ist Pflicht. Die Produkt-SKU wird bei leerem Feld automatisch vergeben.", no_update
         product, _variant = create_product(
             session,
             ProductCreate(
-                sku=sku,
+                sku=(sku or "").strip() or None,
                 title=title,
                 brand_name=brand_name,
                 status=status or "draft",
@@ -12324,7 +13785,7 @@ def register_callbacks(app: Dash) -> None:
                 description=description,
                 is_chemical=bool(is_chemical),
             ),
-            VariantCreate(sku=sku, variant_title=title),
+            VariantCreate(variant_title=title),
         )
         if short_description:
             set_product_translation_short_description(
@@ -12428,23 +13889,46 @@ def register_callbacks(app: Dash) -> None:
         product_id = row.get("id")
         if not product_id:
             return no_update, no_update
-        detail = get_product_detail(session, int(product_id), include_sdb=False)
-        if detail is None:
-            return "Produkt nicht gefunden.", no_update
-        update_product(
-            session,
-            int(product_id),
-            ProductUpdate(
-                title=(row.get("title") or detail["title"] or "").strip(),
-                description=detail.get("description"),
-                brand_name=row.get("brand") or detail.get("brand_name"),
-                status=row.get("status") or detail.get("status") or "draft",
-                source_language=(row.get("source_language") or detail.get("source_language") or "en").strip(),
-                category_channel_code=detail.get("category_channel_code") or DEFAULT_CATEGORY_CHANNEL_CODE,
-                category_ids=detail.get("category_ids") or [],
-            ),
-        )
+        changed_field, changed_value = _grid_cell_change(event)
+        try:
+            _save_product_grid_row(session, row, changed_field=changed_field, changed_value=changed_value)
+        except ValueError as exc:
+            return str(exc), no_update
         return f"Produkt {product_id} direkt gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("product-selection-save-button", "n_clicks"),
+        State("selected-product-ids", "data"),
+        State("products-grid", "rowData"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_selected_products_from_grid_callback(
+        session: Session,
+        n_clicks: int | None,
+        selected_product_ids: list[int] | None,
+        rows: list[dict] | None,
+        refresh_token: int | None,
+    ):
+        if not n_clicks:
+            return no_update, no_update
+        product_ids = [int(product_id) for product_id in (selected_product_ids or [])]
+        if not product_ids:
+            return "Bitte zuerst ein oder mehrere Produkte in der Tabelle markieren.", no_update
+        rows_by_id = {int(row["id"]): row for row in (rows or []) if row.get("id") is not None}
+        missing_ids = [product_id for product_id in product_ids if product_id not in rows_by_id]
+        if missing_ids:
+            return f"Produkt(e) nicht in der aktuellen Tabelle gefunden: {', '.join(map(str, missing_ids[:10]))}", no_update
+        saved_ids: list[int] = []
+        try:
+            for product_id in product_ids:
+                saved_ids.append(_save_product_grid_row(session, rows_by_id[product_id]))
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"{len(saved_ids)} Produkt(e) aus der Tabelle gespeichert.", (refresh_token or 0) + 1
 
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),
@@ -12460,6 +13944,66 @@ def register_callbacks(app: Dash) -> None:
             return "Kein Produkt gewählt.", no_update
         archive_product(session, product_id)
         return f"Produkt {product_id} archiviert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("product-hard-delete-confirm", "displayed"),
+        Output("product-hard-delete-confirm", "message"),
+        Input("product-hard-delete-button", "n_clicks"),
+        State("product-id", "value"),
+        State("product-sku", "value"),
+        State("product-hard-delete-confirmation", "value"),
+        prevent_initial_call=True,
+    )
+    def ask_hard_delete_product_confirm(
+        n_clicks: int | None,
+        product_id: int | None,
+        product_sku: str | None,
+        confirmation: str | None,
+    ):
+        if not n_clicks or not product_id:
+            return False, no_update
+        if (confirmation or "").strip() not in {str(product_id), str(product_sku or "")}:
+            return False, "Bitte Produkt-SKU oder Produkt-ID exakt in das Bestätigungsfeld eintragen."
+        return True, (
+            f"Artikel {product_sku or product_id} endgültig löschen? Artikel, Varianten, Assets, Übersetzungen, "
+            "Preise, Kanal-/Medusa-Zuordnungen und weitere abhängige Daten werden dauerhaft entfernt."
+        )
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Output("last-product-clicked-id", "data", allow_duplicate=True),
+        Output("selected-product-ids", "data", allow_duplicate=True),
+        Input("product-hard-delete-confirm", "submit_n_clicks"),
+        State("refresh-token", "data"),
+        State("product-id", "value"),
+        State("product-hard-delete-confirmation", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def hard_delete_product_callback(
+        session: Session,
+        submit_n_clicks: int | None,
+        refresh_token: int,
+        product_id: int | None,
+        confirmation: str | None,
+    ):
+        if not submit_n_clicks:
+            return no_update, no_update, no_update, no_update
+        if not product_id:
+            return "Kein Produkt gewählt.", no_update, no_update, no_update
+        try:
+            result = hard_delete_product(session, int(product_id), confirmation)
+        except ValueError as exc:
+            return str(exc), no_update, no_update, no_update
+        return (
+            f"Produkt {result['product_sku']} endgültig gelöscht: {result['variants_deleted']} Varianten, "
+            f"{result['assets_deleted']} Assets, {result['translations_deleted']} Übersetzungen, "
+            f"{result['price_tiers_deleted']} Staffelpreise.",
+            (refresh_token or 0) + 1,
+            None,
+            [],
+        )
 
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),
@@ -12825,8 +14369,13 @@ def register_callbacks(app: Dash) -> None:
     @app.callback(
         Output("variant-id", "value"),
         Output("variant-title", "value"),
+        Output("variant-manufacturer-sku", "value"),
+        Output("variant-vendor-description", "value"),
         Output("variant-option-name", "value"),
         Output("variant-option-value", "value"),
+        Output("variant-sales-unit", "value"),
+        Output("variant-pack-quantity", "value"),
+        Output("variant-pack-unit", "value"),
         Output("variant-packaging", "value"),
         Output("variant-price", "value"),
         Output("variant-cost-price", "value"),
@@ -12834,22 +14383,67 @@ def register_callbacks(app: Dash) -> None:
         Output("variant-cost-currency", "value"),
         Output("variant-stock", "value"),
         Output("variant-barcode", "value"),
+        Output("variant-status", "value"),
+        Output("variant-ch-tariff-code", "value"),
+        Output("variant-ch-statistical-key", "value"),
+        Output("variant-origin-country", "value"),
+        Output("variant-customs-description-de", "value"),
+        Output("variant-customs-description-en", "value"),
+        Output("variant-material-composition", "value"),
+        Output("variant-ch-net-mass-kg", "value"),
+        Output("variant-ch-gross-mass-kg", "value"),
+        Output("variant-ch-customs-unit-code", "value"),
+        Output("variant-ch-customs-quantity-per-unit", "value"),
+        Output("variant-ch-nze-code", "value"),
+        Output("variant-ch-flags", "value"),
+        Output("variant-eu-cn-code", "value"),
+        Output("variant-eu-taric-code", "value"),
+        Output("variant-de-import-code", "value"),
+        Output("variant-de-customs-unit-code", "value"),
+        Output("variant-de-customs-quantity-per-unit", "value"),
+        Output("variant-eu-flags", "value"),
+        Output("variant-customs-notes", "value"),
+        Output("variant-customs-codes-grid", "rowData"),
         Output("variant-tier-grid", "rowData"),
+        Output("variant-technical-attributes-grid", "rowData"),
         Input("variants-grid", "selectedRows"),
         Input("refresh-token", "data"),
         State("variants-grid", "rowData"),
     )
     def select_variant(selected_rows: list[dict] | None, _: int | None, row_data: list[dict] | None):
         if not selected_rows:
-            return None, None, None, None, None, None, None, None, None, None, None, []
+            return None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, "active", None, None, None, None, None, None, None, None, None, None, None, [], None, None, None, None, None, [], None, [], [], []
         selected_id = selected_rows[0].get("id")
         current_rows = row_data or []
         row = next((item for item in current_rows if item.get("id") == selected_id), selected_rows[0])
+        ch_flags = []
+        if row.get("ch_preference_possible"):
+            ch_flags.append("preference")
+        if row.get("ch_origin_proof_required"):
+            ch_flags.append("origin_proof")
+        if row.get("ch_nze_required"):
+            ch_flags.append("nze")
+        if row.get("ch_voc_relevant"):
+            ch_flags.append("voc")
+        eu_flags = []
+        if row.get("eu_export_control_required"):
+            eu_flags.append("export_control")
+        if row.get("dual_use_required"):
+            eu_flags.append("dual_use")
+        if row.get("reach_relevant"):
+            eu_flags.append("reach")
+        if row.get("antidumping_relevant"):
+            eu_flags.append("antidumping")
         return (
             row["id"],
             row["variant_title"],
+            row.get("manufacturer_sku"),
+            row.get("vendor_description"),
             row.get("option_name"),
             row.get("option_value"),
+            row.get("sales_unit"),
+            row.get("pack_quantity"),
+            row.get("pack_unit"),
             row.get("packaging"),
             row["price"],
             row.get("cost_price"),
@@ -12857,7 +14451,29 @@ def register_callbacks(app: Dash) -> None:
             row.get("cost_currency"),
             row["stock_qty"],
             row["barcode"],
+            row.get("status") or "active",
+            row.get("ch_tariff_code"),
+            row.get("ch_statistical_key"),
+            row.get("origin_country"),
+            row.get("customs_description_de"),
+            row.get("customs_description_en"),
+            row.get("material_composition"),
+            row.get("ch_net_mass_kg"),
+            row.get("ch_gross_mass_kg"),
+            row.get("ch_customs_unit_code"),
+            row.get("ch_customs_quantity_per_unit"),
+            row.get("ch_nze_code"),
+            ch_flags,
+            row.get("eu_cn_code"),
+            row.get("eu_taric_code"),
+            row.get("de_import_code"),
+            row.get("de_customs_unit_code"),
+            row.get("de_customs_quantity_per_unit"),
+            eu_flags,
+            row.get("customs_notes"),
+            [{**code, "delete_action": "Löschen"} for code in row.get("customs_additional_codes", [])],
             [{**tier, "delete_action": "Löschen"} for tier in row.get("price_tiers", [])],
+            [{**attribute, "delete_action": "Löschen"} for attribute in row.get("technical_attributes", [])],
         )
 
     @app.callback(
@@ -12867,8 +14483,13 @@ def register_callbacks(app: Dash) -> None:
         State("refresh-token", "data"),
         State("variant-id", "value"),
         State("variant-title", "value"),
+        State("variant-manufacturer-sku", "value"),
+        State("variant-vendor-description", "value"),
         State("variant-option-name", "value"),
         State("variant-option-value", "value"),
+        State("variant-sales-unit", "value"),
+        State("variant-pack-quantity", "value"),
+        State("variant-pack-unit", "value"),
         State("variant-packaging", "value"),
         State("variant-price", "value"),
         State("variant-cost-price", "value"),
@@ -12876,6 +14497,26 @@ def register_callbacks(app: Dash) -> None:
         State("variant-cost-currency", "value"),
         State("variant-stock", "value"),
         State("variant-barcode", "value"),
+        State("variant-status", "value"),
+        State("variant-ch-tariff-code", "value"),
+        State("variant-ch-statistical-key", "value"),
+        State("variant-origin-country", "value"),
+        State("variant-customs-description-de", "value"),
+        State("variant-customs-description-en", "value"),
+        State("variant-material-composition", "value"),
+        State("variant-ch-net-mass-kg", "value"),
+        State("variant-ch-gross-mass-kg", "value"),
+        State("variant-ch-customs-unit-code", "value"),
+        State("variant-ch-customs-quantity-per-unit", "value"),
+        State("variant-ch-nze-code", "value"),
+        State("variant-ch-flags", "value"),
+        State("variant-eu-cn-code", "value"),
+        State("variant-eu-taric-code", "value"),
+        State("variant-de-import-code", "value"),
+        State("variant-de-customs-unit-code", "value"),
+        State("variant-de-customs-quantity-per-unit", "value"),
+        State("variant-eu-flags", "value"),
+        State("variant-customs-notes", "value"),
         prevent_initial_call=True,
     )
     @_with_session
@@ -12885,8 +14526,13 @@ def register_callbacks(app: Dash) -> None:
         refresh_token: int,
         variant_id: int | None,
         title: str | None,
+        manufacturer_sku: str | None,
+        vendor_description: str | None,
         option_name: str | None,
         option_value: str | None,
+        sales_unit: str | None,
+        pack_quantity: float | None,
+        pack_unit: str | None,
         packaging: str | None,
         price: float | None,
         cost_price: float | None,
@@ -12894,6 +14540,26 @@ def register_callbacks(app: Dash) -> None:
         cost_currency: str | None,
         stock_qty: int | None,
         barcode: str | None,
+        status: str | None,
+        ch_tariff_code: str | None,
+        ch_statistical_key: str | None,
+        origin_country: str | None,
+        customs_description_de: str | None,
+        customs_description_en: str | None,
+        material_composition: str | None,
+        ch_net_mass_kg: float | None,
+        ch_gross_mass_kg: float | None,
+        ch_customs_unit_code: str | None,
+        ch_customs_quantity_per_unit: float | None,
+        ch_nze_code: str | None,
+        ch_flags: list[str] | None,
+        eu_cn_code: str | None,
+        eu_taric_code: str | None,
+        de_import_code: str | None,
+        de_customs_unit_code: str | None,
+        de_customs_quantity_per_unit: float | None,
+        eu_flags: list[str] | None,
+        customs_notes: str | None,
     ):
         if not variant_id:
             return "Keine Variante gewählt.", no_update
@@ -12902,8 +14568,13 @@ def register_callbacks(app: Dash) -> None:
             variant_id,
             VariantUpdate(
                 variant_title=title,
+                manufacturer_sku=manufacturer_sku,
+                vendor_description=vendor_description,
                 option_name=option_name,
                 option_value=option_value,
+                sales_unit=sales_unit,
+                pack_quantity=_float_or_none(pack_quantity),
+                pack_unit=pack_unit,
                 packaging=packaging,
                 price=_float_or_none(price),
                 cost_price=_float_or_none(cost_price),
@@ -12911,10 +14582,308 @@ def register_callbacks(app: Dash) -> None:
                 cost_currency=cost_currency,
                 stock_qty=_int_or_zero(stock_qty),
                 barcode=barcode,
-                status=None,
+                status=status,
+                customs_description_de=customs_description_de,
+                customs_description_en=customs_description_en,
+                origin_country=origin_country,
+                material_composition=material_composition,
+                ch_tariff_code=ch_tariff_code,
+                ch_statistical_key=ch_statistical_key,
+                ch_customs_unit_code=ch_customs_unit_code,
+                ch_customs_quantity_per_unit=_float_or_none(ch_customs_quantity_per_unit),
+                ch_net_mass_kg=_float_or_none(ch_net_mass_kg),
+                ch_gross_mass_kg=_float_or_none(ch_gross_mass_kg),
+                ch_preference_possible="preference" in (ch_flags or []),
+                ch_origin_proof_required="origin_proof" in (ch_flags or []),
+                ch_nze_required="nze" in (ch_flags or []),
+                ch_nze_code=ch_nze_code,
+                ch_voc_relevant="voc" in (ch_flags or []),
+                eu_cn_code=eu_cn_code,
+                eu_taric_code=eu_taric_code,
+                de_import_code=de_import_code,
+                de_customs_unit_code=de_customs_unit_code,
+                de_customs_quantity_per_unit=_float_or_none(de_customs_quantity_per_unit),
+                eu_export_control_required="export_control" in (eu_flags or []),
+                dual_use_required="dual_use" in (eu_flags or []),
+                reach_relevant="reach" in (eu_flags or []),
+                antidumping_relevant="antidumping" in (eu_flags or []),
+                customs_notes=customs_notes,
             ),
         )
         return f"Variante {variant_id} gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("variant-technical-attribute-id", "value"),
+        Output("variant-technical-attribute-name", "value"),
+        Output("variant-technical-value-text", "value"),
+        Output("variant-technical-value-number", "value"),
+        Output("variant-technical-unit", "value"),
+        Output("variant-technical-sort-order", "value"),
+        Input("variant-technical-attributes-grid", "selectedRows"),
+        Input("variant-technical-new-button", "n_clicks"),
+    )
+    def load_variant_technical_attribute_form(selected_rows: list[dict] | None, _new_clicks: int | None):
+        if ctx.triggered_id == "variant-technical-new-button" or not selected_rows:
+            return None, None, None, None, None, 0
+        row = selected_rows[0]
+        return (
+            row.get("id"),
+            row.get("attribute_name"),
+            row.get("value_text"),
+            row.get("value_number"),
+            row.get("unit"),
+            row.get("sort_order") or 0,
+        )
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("variant-technical-save-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("variant-id", "value"),
+        State("variant-technical-attribute-id", "value"),
+        State("variant-technical-attribute-name", "value"),
+        State("variant-technical-value-text", "value"),
+        State("variant-technical-value-number", "value"),
+        State("variant-technical-unit", "value"),
+        State("variant-technical-sort-order", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_variant_technical_attribute_callback(
+        session: Session,
+        _clicks: int | None,
+        refresh_token: int | None,
+        variant_id: int | None,
+        attribute_id: int | None,
+        attribute_name: str | None,
+        value_text: str | None,
+        value_number: float | None,
+        unit: str | None,
+        sort_order: int | None,
+    ):
+        if not variant_id:
+            return "Keine Variante gewählt.", no_update
+        try:
+            row = upsert_variant_technical_attribute(
+                session,
+                VariantTechnicalAttributeUpsert(
+                    id=attribute_id,
+                    variant_id=int(variant_id),
+                    attribute_name=attribute_name or "",
+                    value_text=value_text,
+                    value_number=_float_or_none(value_number),
+                    unit=unit,
+                    sort_order=_int_or_zero(sort_order),
+                ),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Technikwert {row.attribute_name} gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("variant-technical-delete-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("variant-technical-attributes-grid", "selectedRows"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def delete_variant_technical_attributes_callback(
+        session: Session,
+        _clicks: int | None,
+        refresh_token: int | None,
+        selected_rows: list[dict] | None,
+    ):
+        ids = [int(row["id"]) for row in selected_rows or [] if row.get("id")]
+        if not ids:
+            return "Kein Technikwert ausgewählt.", no_update
+        for attribute_id in ids:
+            delete_variant_technical_attribute(session, attribute_id)
+        return f"{len(ids)} Technikwert(e) gelöscht.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("variant-technical-attributes-grid", "cellValueChanged"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_variant_technical_grid_cell_callback(session: Session, event: dict | None, refresh_token: int | None):
+        if not event:
+            return no_update, no_update
+        row = dict(event.get("data") or {})
+        if not row.get("variant_id") or not row.get("attribute_name"):
+            return no_update, no_update
+        try:
+            changed_field, changed_value = _grid_cell_change(event)
+            if changed_field and changed_value is not _GRID_VALUE_MISSING:
+                row[changed_field] = changed_value
+            upsert_variant_technical_attribute(
+                session,
+                VariantTechnicalAttributeUpsert(
+                    id=row.get("id"),
+                    variant_id=int(row["variant_id"]),
+                    attribute_code=row.get("attribute_code"),
+                    attribute_name=row.get("attribute_name") or "",
+                    value_text=row.get("value_text"),
+                    value_number=_float_or_none(row.get("value_number")),
+                    unit=row.get("unit"),
+                    sort_order=_int_or_zero(row.get("sort_order")),
+                ),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return "Technikwert direkt gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("variant-customs-code-id", "value"),
+        Output("variant-customs-code-jurisdiction", "value"),
+        Output("variant-customs-code-flow", "value"),
+        Output("variant-customs-code-code", "value"),
+        Output("variant-customs-code-description", "value"),
+        Output("variant-customs-code-valid-from", "value"),
+        Output("variant-customs-code-valid-to", "value"),
+        Output("variant-customs-code-status", "value"),
+        Output("variant-customs-code-source", "value"),
+        Input("variant-customs-codes-grid", "selectedRows"),
+        Input("variant-customs-code-new-button", "n_clicks"),
+    )
+    def select_variant_customs_code(selected_rows: list[dict] | None, _new_clicks: int | None):
+        if ctx.triggered_id == "variant-customs-code-new-button" or not selected_rows:
+            return None, "CH", "import", None, None, None, None, "active", None
+        row = selected_rows[0]
+        return (
+            row.get("id"),
+            row.get("jurisdiction") or "CH",
+            row.get("flow") or "import",
+            row.get("code"),
+            row.get("description"),
+            row.get("valid_from"),
+            row.get("valid_to"),
+            row.get("status") or "active",
+            row.get("source"),
+        )
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("variant-customs-code-save-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("variant-id", "value"),
+        State("variant-customs-code-id", "value"),
+        State("variant-customs-code-jurisdiction", "value"),
+        State("variant-customs-code-flow", "value"),
+        State("variant-customs-code-code", "value"),
+        State("variant-customs-code-description", "value"),
+        State("variant-customs-code-valid-from", "value"),
+        State("variant-customs-code-valid-to", "value"),
+        State("variant-customs-code-status", "value"),
+        State("variant-customs-code-source", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_variant_customs_code_callback(
+        session: Session,
+        _: int | None,
+        refresh_token: int | None,
+        variant_id: int | None,
+        code_id: int | None,
+        jurisdiction: str | None,
+        flow: str | None,
+        code: str | None,
+        description: str | None,
+        valid_from: str | None,
+        valid_to: str | None,
+        status: str | None,
+        source: str | None,
+    ):
+        if not variant_id:
+            return "Keine Variante gewählt.", no_update
+        try:
+            row = upsert_variant_customs_additional_code(
+                session,
+                VariantCustomsAdditionalCodeUpsert(
+                    id=code_id,
+                    variant_id=int(variant_id),
+                    jurisdiction=jurisdiction or "CH",
+                    flow=flow or "import",
+                    code=code or "",
+                    description=description,
+                    valid_from=(valid_from or "").strip() or None,
+                    valid_to=(valid_to or "").strip() or None,
+                    status=status or "active",
+                    source=source,
+                ),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Zoll-Zusatzcode {row.code} gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("variant-customs-codes-grid", "cellClicked"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def delete_variant_customs_code_callback(session: Session, event: dict | None, refresh_token: int | None):
+        if not event or event.get("colId") != "delete_action":
+            return no_update, no_update
+        row = event.get("data") or {}
+        code_id = row.get("id")
+        if not code_id:
+            return no_update, no_update
+        try:
+            delete_variant_customs_additional_code(session, int(code_id))
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Zoll-Zusatzcode {code_id} gelöscht.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("variant-customs-codes-grid", "cellValueChanged"),
+        State("refresh-token", "data"),
+        State("variant-id", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_variant_customs_code_grid_edit_callback(
+        session: Session,
+        event: dict | list[dict] | None,
+        refresh_token: int | None,
+        variant_id: int | None,
+    ):
+        if not event or not variant_id:
+            return no_update, no_update
+        event_payload = event[-1] if isinstance(event, list) else event
+        row = event_payload.get("data") or {}
+        code_id = row.get("id")
+        if not code_id:
+            return no_update, no_update
+        try:
+            upsert_variant_customs_additional_code(
+                session,
+                VariantCustomsAdditionalCodeUpsert(
+                    id=int(code_id),
+                    variant_id=int(variant_id),
+                    jurisdiction=row.get("jurisdiction") or "CH",
+                    flow=row.get("flow") or "import",
+                    code=row.get("code") or "",
+                    description=row.get("description"),
+                    valid_from=(row.get("valid_from") or "").strip() or None,
+                    valid_to=(row.get("valid_to") or "").strip() or None,
+                    status=row.get("status") or "active",
+                    source=row.get("source"),
+                ),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Zoll-Zusatzcode {code_id} direkt gespeichert.", (refresh_token or 0) + 1
 
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),
@@ -12935,24 +14904,276 @@ def register_callbacks(app: Dash) -> None:
         variant_id = row.get("id")
         if not variant_id:
             return no_update, no_update
-        update_variant(
-            session,
-            int(variant_id),
-            VariantUpdate(
-                variant_title=row.get("variant_title"),
-                option_name=row.get("option_name"),
-                option_value=row.get("option_value"),
-                packaging=row.get("packaging"),
-                price=_float_or_none(row.get("price")),
-                cost_price=_float_or_none(row.get("cost_price")),
-                currency=row.get("currency"),
-                cost_currency=row.get("cost_currency"),
-                stock_qty=_int_or_zero(row.get("stock_qty")),
-                barcode=row.get("barcode"),
-                status=row.get("status"),
-            ),
-        )
+        try:
+            changed_field, changed_value = _grid_cell_change(event)
+            _save_variant_grid_row(session, row, changed_field=changed_field, changed_value=changed_value)
+        except ValueError as exc:
+            return str(exc), no_update
         return f"Variante {variant_id} direkt gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("variant-selection-save-button", "n_clicks"),
+        State("variants-grid", "selectedRows"),
+        State("variants-grid", "rowData"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_selected_variants_from_grid_callback(
+        session: Session,
+        n_clicks: int | None,
+        selected_rows: list[dict] | None,
+        rows: list[dict] | None,
+        refresh_token: int | None,
+    ):
+        if not n_clicks:
+            return no_update, no_update
+        variant_ids = [int(row["id"]) for row in (selected_rows or []) if row.get("id") is not None]
+        if not variant_ids:
+            return "Bitte zuerst ein oder mehrere Varianten in der Tabelle markieren.", no_update
+        rows_by_id = {int(row["id"]): row for row in (rows or []) if row.get("id") is not None}
+        missing_ids = [variant_id for variant_id in variant_ids if variant_id not in rows_by_id]
+        if missing_ids:
+            return f"Variante(n) nicht in der aktuellen Tabelle gefunden: {', '.join(map(str, missing_ids[:10]))}", no_update
+        saved_ids: list[int] = []
+        try:
+            for variant_id in variant_ids:
+                saved_ids.append(_save_variant_grid_row(session, rows_by_id[variant_id]))
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"{len(saved_ids)} Variante(n) aus der Tabelle gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("price-list-id", "value"),
+        Output("price-list-code", "value"),
+        Output("price-list-name", "value"),
+        Output("price-list-type", "value"),
+        Output("price-list-sales-channel-id", "value"),
+        Output("price-list-currency", "value"),
+        Output("price-list-valid-from", "value"),
+        Output("price-list-valid-to", "value"),
+        Output("price-list-status", "value"),
+        Input("price-lists-grid", "selectedRows"),
+    )
+    def select_price_list(selected_rows: list[dict] | None):
+        if not selected_rows:
+            return None, None, None, "sale", None, "CHF", None, None, "active"
+        row = selected_rows[0]
+        return (
+            row.get("id"),
+            row.get("code"),
+            row.get("name"),
+            row.get("price_list_type") or "sale",
+            row.get("sales_channel_id"),
+            row.get("currency") or "CHF",
+            row.get("valid_from"),
+            row.get("valid_to"),
+            row.get("status") or "active",
+        )
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("price-list-save-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("price-list-id", "value"),
+        State("price-list-code", "value"),
+        State("price-list-name", "value"),
+        State("price-list-type", "value"),
+        State("price-list-sales-channel-id", "value"),
+        State("price-list-currency", "value"),
+        State("price-list-valid-from", "value"),
+        State("price-list-valid-to", "value"),
+        State("price-list-status", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_price_list_callback(
+        session: Session,
+        _: int | None,
+        refresh_token: int | None,
+        price_list_id: int | None,
+        code: str | None,
+        name: str | None,
+        price_list_type: str | None,
+        sales_channel_id: int | str | None,
+        currency: str | None,
+        valid_from: str | None,
+        valid_to: str | None,
+        status: str | None,
+    ):
+        try:
+            price_list = upsert_price_list(
+                session,
+                PriceListUpsert(
+                    id=price_list_id,
+                    code=code or "",
+                    name=name or code or "",
+                    price_list_type=price_list_type or "sale",
+                    sales_channel_id=_int_or_none(sales_channel_id),
+                    currency=currency or "CHF",
+                    valid_from=(valid_from or "").strip() or None,
+                    valid_to=(valid_to or "").strip() or None,
+                    status=status or "active",
+                ),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Preisliste {price_list.code} gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("currency-rate-id", "value"),
+        Output("currency-source", "value"),
+        Output("currency-target", "value"),
+        Output("currency-effective-rate", "value"),
+        Output("currency-markup-percent", "value"),
+        Output("currency-used-rate", "value"),
+        Output("currency-rate-date", "value"),
+        Output("currency-status", "value"),
+        Input("currency-rates-grid", "selectedRows"),
+        Input("currency-new-button", "n_clicks"),
+    )
+    def select_currency_rate(selected_rows: list[dict] | None, _new_clicks: int | None):
+        if ctx.triggered_id == "currency-new-button" or not selected_rows:
+            return None, None, "CHF", None, 0, None, None, "active"
+        row = selected_rows[0]
+        return (
+            row.get("id"),
+            row.get("source_currency"),
+            row.get("target_currency") or "CHF",
+            row.get("effective_rate"),
+            row.get("markup_percent") or 0,
+            row.get("used_rate"),
+            row.get("rate_date"),
+            row.get("status") or "active",
+        )
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("currency-save-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("currency-rate-id", "value"),
+        State("currency-source", "value"),
+        State("currency-target", "value"),
+        State("currency-effective-rate", "value"),
+        State("currency-markup-percent", "value"),
+        State("currency-used-rate", "value"),
+        State("currency-rate-date", "value"),
+        State("currency-status", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_currency_rate_callback(
+        session: Session,
+        _: int | None,
+        refresh_token: int | None,
+        rate_id: int | None,
+        source_currency: str | None,
+        target_currency: str | None,
+        effective_rate: float | None,
+        markup_percent: float | None,
+        used_rate: float | None,
+        rate_date: str | None,
+        status: str | None,
+    ):
+        if not source_currency or not target_currency or effective_rate is None or used_rate is None:
+            return "Von-Währung, Nach-Währung, effektiver Kurs und verwendeter Kurs sind Pflicht.", no_update
+        try:
+            rate = upsert_currency_rate(
+                session,
+                CurrencyRateUpsert(
+                    id=rate_id,
+                    source_currency=source_currency,
+                    target_currency=target_currency,
+                    effective_rate=effective_rate,
+                    markup_percent=markup_percent or 0,
+                    used_rate=used_rate,
+                    rate_date=(rate_date or "").strip() or None,
+                    status=status or "active",
+                ),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Währungskurs {rate.source_currency}/{rate.target_currency} gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("surcharge-id", "value"),
+        Output("surcharge-code", "value"),
+        Output("surcharge-name", "value"),
+        Output("surcharge-type", "value"),
+        Output("surcharge-scope-type", "value"),
+        Output("surcharge-scope-value", "value"),
+        Output("surcharge-percent", "value"),
+        Output("surcharge-status", "value"),
+        Input("cost-surcharges-grid", "selectedRows"),
+        Input("surcharge-new-button", "n_clicks"),
+    )
+    def select_cost_surcharge(selected_rows: list[dict] | None, _new_clicks: int | None):
+        if ctx.triggered_id == "surcharge-new-button" or not selected_rows:
+            return None, None, None, "transport", "global", None, 0, "active"
+        row = selected_rows[0]
+        return (
+            row.get("id"),
+            row.get("code"),
+            row.get("name"),
+            row.get("surcharge_type") or "transport",
+            row.get("scope_type") or "global",
+            row.get("scope_value"),
+            row.get("percent") or 0,
+            row.get("status") or "active",
+        )
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("surcharge-save-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("surcharge-id", "value"),
+        State("surcharge-code", "value"),
+        State("surcharge-name", "value"),
+        State("surcharge-type", "value"),
+        State("surcharge-scope-type", "value"),
+        State("surcharge-scope-value", "value"),
+        State("surcharge-percent", "value"),
+        State("surcharge-status", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_cost_surcharge_callback(
+        session: Session,
+        _: int | None,
+        refresh_token: int | None,
+        surcharge_id: int | None,
+        code: str | None,
+        name: str | None,
+        surcharge_type: str | None,
+        scope_type: str | None,
+        scope_value: str | None,
+        percent: float | None,
+        status: str | None,
+    ):
+        if not code or not name or percent is None:
+            return "Code, Name und Prozent sind Pflicht.", no_update
+        try:
+            surcharge = upsert_cost_surcharge(
+                session,
+                CostSurchargeUpsert(
+                    id=surcharge_id,
+                    code=code,
+                    name=name,
+                    surcharge_type=surcharge_type or "transport",
+                    scope_type=scope_type or "global",
+                    scope_value=(scope_value or "").strip() or None,
+                    percent=percent,
+                    status=status or "active",
+                ),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Zuschlag {surcharge.code} gespeichert.", (refresh_token or 0) + 1
 
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),
@@ -12960,11 +15181,13 @@ def register_callbacks(app: Dash) -> None:
         Input("tier-save-button", "n_clicks"),
         State("refresh-token", "data"),
         State("variant-id", "value"),
+        State("tier-price-list-id", "value"),
         State("tier-price-type", "value"),
         State("tier-min-qty", "value"),
         State("tier-max-qty", "value"),
         State("tier-price", "value"),
         State("tier-currency", "value"),
+        State("tier-status", "value"),
         prevent_initial_call=True,
     )
     @_with_session
@@ -12973,11 +15196,13 @@ def register_callbacks(app: Dash) -> None:
         _: int,
         refresh_token: int,
         variant_id: int | None,
+        price_list_id: int | str | None,
         price_type: str | None,
         min_qty: int | None,
         max_qty: int | None,
         price: float | None,
         currency: str | None,
+        status: str | None,
     ):
         if not variant_id or price is None or not currency:
             return "Variante, Preis und Währung sind Pflicht.", no_update
@@ -12985,14 +15210,16 @@ def register_callbacks(app: Dash) -> None:
             session,
             VariantPriceTierCreate(
                 variant_id=variant_id,
+                price_list_id=_int_or_none(price_list_id),
                 price_type=price_type or "sale",
                 min_qty=min_qty or 1,
                 max_qty=max_qty,
                 price=price,
                 currency=currency,
+                status=status or "active",
             ),
         )
-        return f"Staffelpreis für Variante {variant_id} gespeichert.", (refresh_token or 0) + 1
+        return f"Preis für Variante {variant_id} gespeichert.", (refresh_token or 0) + 1
 
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),
@@ -13021,14 +15248,16 @@ def register_callbacks(app: Dash) -> None:
             int(tier_id),
             VariantPriceTierCreate(
                 variant_id=int(current_variant_id),
+                price_list_id=_int_or_none(row.get("price_list_id")),
                 price_type=(row.get("price_type") or "sale"),
                 min_qty=_int_or_zero(row.get("min_qty")) or 1,
                 max_qty=_int_or_none(row.get("max_qty")),
                 price=_float_or_none(row.get("price")) or 0,
                 currency=(row.get("currency") or "EUR"),
+                status=(row.get("status") or "active"),
             ),
         )
-        return f"Staffelpreis {tier_id} direkt gespeichert.", (refresh_token or 0) + 1
+        return f"Preis {tier_id} direkt gespeichert.", (refresh_token or 0) + 1
 
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),
@@ -13057,6 +15286,56 @@ def register_callbacks(app: Dash) -> None:
             return no_update, no_update
         delete_variant_price_tier(session, int(tier_id))
         return f"Staffelpreis {tier_id} gelöscht.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Output("product-detail-tiers", "selectedRows", allow_duplicate=True),
+        Output("variant-tier-grid", "selectedRows", allow_duplicate=True),
+        Input("product-detail-tier-delete-selected-button", "n_clicks"),
+        Input("variant-tier-delete-selected-button", "n_clicks"),
+        State("product-detail-tiers", "selectedRows"),
+        State("variant-tier-grid", "selectedRows"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def delete_selected_tiers_callback(
+        session: Session,
+        product_detail_clicks: int | None,
+        variant_clicks: int | None,
+        product_detail_rows: list[dict] | None,
+        variant_rows: list[dict] | None,
+        refresh_token: int | None,
+    ):
+        if not product_detail_clicks and not variant_clicks:
+            return no_update, no_update, no_update, no_update
+        rows = product_detail_rows if ctx.triggered_id == "product-detail-tier-delete-selected-button" else variant_rows
+        tier_ids: list[int] = []
+        for row in rows or []:
+            tier_id = row.get("id")
+            if tier_id is None:
+                continue
+            try:
+                tier_id_int = int(tier_id)
+            except (TypeError, ValueError):
+                continue
+            if tier_id_int not in tier_ids:
+                tier_ids.append(tier_id_int)
+        if not tier_ids:
+            return "Keine Staffelpreise ausgewählt.", no_update, no_update, no_update
+        deleted = 0
+        errors: list[str] = []
+        for tier_id in tier_ids:
+            try:
+                delete_variant_price_tier(session, tier_id)
+                deleted += 1
+            except ValueError as exc:
+                errors.append(f"{tier_id}: {exc}")
+        message = f"{deleted} Staffelpreis(e) gelöscht."
+        if errors:
+            message += " Fehler: " + "; ".join(errors[:5])
+        return message, (refresh_token or 0) + 1, [], []
 
     @app.callback(
         Output("flash-message", "children", allow_duplicate=True),
@@ -13145,12 +15424,109 @@ def register_callbacks(app: Dash) -> None:
         return f"Varianten-Übersetzung {language_code} gespeichert.", (refresh_token or 0) + 1
 
     @app.callback(
+        Output("technical-label-translation-id", "value"),
+        Output("technical-label-code", "value"),
+        Output("technical-label-language", "value"),
+        Output("technical-label-text", "value"),
+        Input("technical-label-translations-grid", "selectedRows"),
+    )
+    def load_technical_label_translation_form(selected_rows: list[dict] | None):
+        if not selected_rows:
+            return None, None, None, None
+        row = selected_rows[0]
+        return row.get("id"), row.get("attribute_code"), row.get("language_code"), row.get("label")
+
+    @app.callback(
+        Output("technical-value-translation-id", "value"),
+        Output("technical-value-attribute-id", "value"),
+        Output("technical-value-language", "value"),
+        Output("technical-value-text", "value"),
+        Input("technical-value-translations-grid", "selectedRows"),
+    )
+    def load_technical_value_translation_form(selected_rows: list[dict] | None):
+        if not selected_rows:
+            return None, None, None, None
+        row = selected_rows[0]
+        return row.get("id"), row.get("technical_attribute_id"), row.get("language_code"), row.get("value_text")
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("technical-label-save-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("technical-label-translation-id", "value"),
+        State("technical-label-code", "value"),
+        State("technical-label-language", "value"),
+        State("technical-label-text", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_technical_label_translation_callback(
+        session: Session,
+        _: int | None,
+        refresh_token: int | None,
+        translation_id: int | None,
+        attribute_code: str | None,
+        language_code: str | None,
+        label: str | None,
+    ):
+        try:
+            row = upsert_technical_attribute_label_translation(
+                session,
+                TechnicalAttributeLabelTranslationUpsert(
+                    id=translation_id,
+                    attribute_code=attribute_code or "",
+                    language_code=language_code or "",
+                    label=label or "",
+                ),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Technisches Label {row.attribute_code}/{row.language_code} gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("technical-value-save-button", "n_clicks"),
+        State("refresh-token", "data"),
+        State("technical-value-translation-id", "value"),
+        State("technical-value-attribute-id", "value"),
+        State("technical-value-language", "value"),
+        State("technical-value-text", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_technical_value_translation_callback(
+        session: Session,
+        _: int | None,
+        refresh_token: int | None,
+        translation_id: int | None,
+        technical_attribute_id: int | None,
+        language_code: str | None,
+        value_text: str | None,
+    ):
+        try:
+            row = upsert_variant_technical_attribute_value_translation(
+                session,
+                VariantTechnicalAttributeValueTranslationUpsert(
+                    id=translation_id,
+                    technical_attribute_id=int(technical_attribute_id or 0),
+                    language_code=language_code or "",
+                    value_text=value_text or "",
+                ),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Technischer Wert {row.technical_attribute_id}/{row.language_code} gespeichert.", (refresh_token or 0) + 1
+
+    @app.callback(
         Output("flash-message", "children", allow_duplicate=True),
         Output("asset-upload-status", "children"),
         Output("refresh-token", "data", allow_duplicate=True),
         Input("asset-upload", "contents"),
         State("refresh-token", "data"),
         State("asset-upload", "filename"),
+        State("asset-upload-language-code", "value"),
         State("product-id", "value"),
         State("product-title", "value"),
         prevent_initial_call=True,
@@ -13161,6 +15537,7 @@ def register_callbacks(app: Dash) -> None:
         contents: str | None,
         refresh_token: int,
         filename: str | None,
+        language_code: str | None,
         product_id: int | None,
         product_title: str | None,
     ):
@@ -13177,12 +15554,108 @@ def register_callbacks(app: Dash) -> None:
                 target = storage_root / f"{Path(filename).stem}-{counter}{Path(filename).suffix}"
                 counter += 1
             target.write_bytes(payload)
-            create_asset_record(session, target, product_id=product_id, alt_text=product_title)
+            create_asset_record(
+                session,
+                target,
+                product_id=product_id,
+                alt_text=product_title,
+                language_code=(language_code or "").strip() or None,
+            )
         except Exception as exc:
             message = f"Asset-Upload fehlgeschlagen: {exc}"
             return message, message, no_update
         message = f"Asset {target.name} für Produkt {product_id} gespeichert."
         return message, message, (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("variant-asset-upload-status", "children"),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("variant-asset-upload", "contents"),
+        State("refresh-token", "data"),
+        State("variant-asset-upload", "filename"),
+        State("variant-asset-upload-language-code", "value"),
+        State("variant-id", "value"),
+        State("variant-title", "value"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def upload_variant_asset_callback(
+        session: Session,
+        contents: str | None,
+        refresh_token: int,
+        filename: str | None,
+        language_code: str | None,
+        variant_id: int | None,
+        variant_title: str | None,
+    ):
+        if not contents or not filename or not variant_id:
+            return "Variante und Datei sind Pflicht.", "Variante und Datei sind Pflicht.", no_update
+        try:
+            _header, encoded = contents.split(",", 1)
+            payload = base64.b64decode(encoded)
+            storage_root = get_pim_settings().asset_storage_root / f"variant-{variant_id}"
+            storage_root.mkdir(parents=True, exist_ok=True)
+            target = storage_root / filename
+            counter = 2
+            while target.exists():
+                target = storage_root / f"{Path(filename).stem}-{counter}{Path(filename).suffix}"
+                counter += 1
+            target.write_bytes(payload)
+            create_asset_record(
+                session,
+                target,
+                variant_id=variant_id,
+                alt_text=variant_title,
+                language_code=(language_code or "").strip() or None,
+            )
+        except Exception as exc:
+            message = f"Varianten-Asset-Upload fehlgeschlagen: {exc}"
+            return message, message, no_update
+        message = f"Asset {target.name} für Variante {variant_id} gespeichert."
+        return message, message, (refresh_token or 0) + 1
+
+    @app.callback(
+        Output("flash-message", "children", allow_duplicate=True),
+        Output("refresh-token", "data", allow_duplicate=True),
+        Input("assets-grid", "cellValueChanged"),
+        Input("product-detail-assets", "cellValueChanged"),
+        Input("variant-detail-assets", "cellValueChanged"),
+        State("refresh-token", "data"),
+        prevent_initial_call=True,
+    )
+    @_with_session
+    def save_asset_grid_edit_callback(
+        session: Session,
+        assets_event: dict | None,
+        product_assets_event: dict | None,
+        variant_assets_event: dict | None,
+        refresh_token: int,
+    ):
+        if ctx.triggered_id == "product-detail-assets":
+            event = product_assets_event
+        elif ctx.triggered_id == "variant-detail-assets":
+            event = variant_assets_event
+        else:
+            event = assets_event
+        if not event:
+            return no_update, no_update
+        row = event.get("data") or {}
+        asset_id = row.get("id")
+        if not asset_id:
+            return no_update, no_update
+        try:
+            update_asset_metadata(
+                session,
+                int(asset_id),
+                title=row.get("title"),
+                asset_type=row.get("asset_type"),
+                language_code=row.get("language_code"),
+                status=row.get("status"),
+            )
+        except ValueError as exc:
+            return str(exc), no_update
+        return f"Asset {asset_id} gespeichert.", (refresh_token or 0) + 1
 
     @app.callback(
         Output("r2-config-enabled", "value"),
@@ -13894,20 +16367,41 @@ def configure_dash_app(app: Dash) -> Dash:
         {%css%}
         <style>
           body { font-family: Arial, sans-serif; margin: 0; background: #f6f7fb; color: #1f2937; }
-          .page { padding: 20px; }
-          .page-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
-          .page-body { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 20px; align-items: start; }
+          .page { padding: 12px 16px; }
+          .page-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+          .page-header-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+          .page-body { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 12px; align-items: start; }
           .page-body-collapsed { grid-template-columns: 56px minmax(0, 1fr); }
-          .page-title { margin: 0; font-size: 32px; line-height: 1.1; }
+          .page-title { margin: 0; font-size: 18px; line-height: 1.1; font-weight: 700; white-space: nowrap; }
+          .process-status-panel { border-radius: 6px; padding: 5px 7px; font-size: 12px; line-height: 1.25; max-width: min(900px, 62vw); overflow: hidden; border: 1px solid #cbd5e1; }
+          .process-status-panel-running { background: #eff6ff; color: #1d4ed8; border-color: #93c5fd; }
+          .process-status-panel-success { background: #ecfdf5; color: #047857; border-color: #86efac; }
+          .process-status-panel-partial_success { background: #fffbeb; color: #b45309; border-color: #fcd34d; }
+          .process-status-panel-error { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+          .process-status-panel-cancelled, .process-status-panel-ready { background: #f8fafc; color: #475569; border-color: #cbd5e1; }
+          .process-status-summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+          .process-status-summary-main { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; min-width: 0; }
+          .process-status-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; font-weight: 800; background: rgba(255,255,255,0.7); }
+          .process-status-icon-running { animation: process-spin 1s linear infinite; }
+          @keyframes process-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+          .process-status-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+          .process-status-pill { background: rgba(255,255,255,0.62); border: 1px solid rgba(148,163,184,0.45); border-radius: 999px; padding: 1px 6px; white-space: nowrap; }
+          .process-status-actions { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+          .process-status-button, .process-status-close-button { padding: 3px 7px; border: 1px solid rgba(100,116,139,0.35); border-radius: 5px; background: rgba(255,255,255,0.75); color: inherit; cursor: pointer; font-size: 12px; line-height: 1.2; }
+          .process-status-button:disabled { opacity: 0.5; cursor: default; }
+          .process-status-close-button { width: 24px; padding: 3px 0; font-weight: 800; }
+          .process-status-details { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); gap: 4px 12px; margin-top: 6px; }
+          .process-status-error-message { margin-top: 5px; font-weight: 700; }
+          .process-status-log { white-space: pre-wrap; font-size: 12px; margin: 6px 0 0; max-height: 180px; overflow: auto; }
           .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
           .toolbar-link-button { display: inline-block; padding: 8px 12px; border: 1px solid #1f2937; background: white; border-radius: 4px; cursor: pointer; color: #111827; text-decoration: none; line-height: 1.2; }
-          .sidebar-shell { display: grid; gap: 10px; position: sticky; top: 20px; align-self: start; }
+          .sidebar-shell { display: grid; gap: 6px; position: sticky; top: 12px; align-self: start; }
           .sidebar-toggle-row { display: flex; justify-content: flex-end; }
           .sidebar-toggle-button { width: 40px; min-width: 40px; padding: 8px 0; font-size: 18px; line-height: 1; }
-          .sidebar-nav { display: grid; gap: 8px; }
+          .sidebar-nav { display: grid; gap: 5px; }
           .sidebar-shell-collapsed .sidebar-toggle-row { justify-content: center; }
           .sidebar-nav-collapsed { display: none; }
-          .sidebar-nav-button { text-align: left; width: 100%; padding: 10px 12px; border: 1px solid #d5d9e2; background: white; border-radius: 8px; cursor: pointer; font-weight: 600; }
+          .sidebar-nav-button { text-align: left; width: 100%; padding: 8px 10px; border: 1px solid #d5d9e2; background: white; border-radius: 8px; cursor: pointer; font-weight: 600; }
           .sidebar-nav-button-active { background: #1f2937; color: white; border-color: #1f2937; }
           .sidebar-shell-collapsed { width: 56px; }
           .main-tabs-panel { min-width: 0; }
@@ -13919,7 +16413,16 @@ def configure_dash_app(app: Dash) -> Dash:
           .form-grid { display: grid; gap: 10px; margin: 12px 0 20px; }
           .form-section-heading { margin: 4px 0 0; font-size: 16px; color: #111827; }
           .variant-editor-layout { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 12px; align-items: start; margin-top: 12px; }
+          .variant-master-layout { display: grid; grid-template-columns: minmax(520px, 1.1fr) minmax(420px, 0.9fr); gap: 12px; align-items: start; margin-top: 12px; }
           .variant-form-card { display: grid; gap: 10px; margin: 12px 0 20px; max-width: 980px; background: white; border: 1px solid #d5d9e2; border-radius: 8px; padding: 12px; }
+          .variant-master-layout .variant-form-card { max-width: none; margin: 0; }
+          .variant-tab-stack { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; }
+          .variant-tab-stack .panel, .variant-tab-stack .variant-form-card { max-width: none; margin: 0; }
+          .variant-price-form-grid { grid-template-columns: repeat(4, minmax(170px, 1fr)); align-items: end; }
+          .variant-price-form-grid label { display: block; font-size: 12px; font-weight: 700; color: #4b5563; margin-bottom: 4px; }
+          .variant-technical-card { margin: 0; }
+          .variant-technical-form-grid { display: grid; grid-template-columns: repeat(3, minmax(130px, 1fr)); gap: 10px; align-items: end; margin-bottom: 10px; }
+          .variant-technical-form-grid label { display: block; font-size: 12px; font-weight: 700; color: #4b5563; margin-bottom: 4px; }
           .variant-form-row { display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 12px; }
           .variant-form-row--wide { grid-template-columns: 140px minmax(280px, 1fr); }
           .variant-form-row--compact { grid-template-columns: 160px minmax(220px, 1fr) 180px; }
@@ -13934,12 +16437,15 @@ def configure_dash_app(app: Dash) -> Dash:
           .detail-columns { display: grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap: 12px; margin-top: 12px; }
           .translation-layout { display: grid; gap: 12px; }
           .translation-row { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(520px, 2fr); gap: 12px; align-items: start; }
+          .translation-overview-grid { display: grid; grid-template-columns: repeat(2, minmax(360px, 1fr)); gap: 16px; align-items: start; }
+          .translation-technical-form-grid { grid-template-columns: repeat(4, minmax(140px, 1fr)); align-items: end; }
           .detail-tabs { margin-top: 8px; }
           .detail-tab { padding: 10px 14px !important; border: 1px solid #d5d9e2 !important; border-bottom: none !important; background: #f7f8fb !important; border-radius: 8px 8px 0 0 !important; font-weight: 600; }
           .detail-tab-selected { background: white !important; color: #111827 !important; border-color: #d5d9e2 !important; }
           .detail-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 10px 18px; }
-          .flash { min-height: 24px; margin: 8px 0 16px; color: #0f5132; font-weight: 600; }
+          .flash { min-height: 18px; margin: 2px 0 6px; color: #0f5132; font-weight: 600; }
           .selection-summary { margin: 0 0 12px; color: #4b5563; font-weight: 600; }
+          .product-detail-dirty-message { display: inline-block; margin-top: 8px; padding: 7px 10px; border: 1px solid #f59e0b; border-radius: 6px; background: #fffbeb; color: #92400e; font-weight: 800; }
           .crawler-modal-panel { background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%); border-radius: 18px; padding: 0; width: min(1180px, 100%); max-height: 92vh; overflow: auto; box-shadow: 0 24px 70px rgba(15, 23, 42, 0.26); border: 1px solid #e5e7eb; }
           .crawler-modal-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; padding: 24px 26px 18px; border-bottom: 1px solid #e5e7eb; background: radial-gradient(circle at top left, #e0f2fe 0, rgba(224, 242, 254, 0) 36%), #ffffff; }
           .crawler-modal-title { margin: 0; font-size: 26px; letter-spacing: -0.02em; color: #0f172a; }
@@ -13995,7 +16501,7 @@ def configure_dash_app(app: Dash) -> Dash:
           @keyframes crawler-spin { to { transform: rotate(360deg); } }
           input, textarea { padding: 8px; border: 1px solid #c7ccd8; border-radius: 4px; }
           button { padding: 8px 12px; border: 1px solid #1f2937; background: white; border-radius: 4px; cursor: pointer; }
-          @media (max-width: 960px) { .page-header, .page-body, .metrics, .detail-columns, .category-browser-layout, .detail-summary-grid, .variant-editor-layout, .variant-form-row, .variant-form-row--wide, .variant-form-row--compact, .category-form-row, .category-form-row--compact, .translation-row, .crawler-source-grid, .crawler-options-grid, .crawler-result-grid, .unified-enrichment-grid { grid-template-columns: 1fr; } .page-header { display: grid; } .sidebar-shell { position: static; } .page-body-collapsed { grid-template-columns: 1fr; } .crawler-modal-header { display: grid; } .crawler-field-wide { grid-column: auto; } }
+          @media (max-width: 960px) { .page-header, .page-body, .metrics, .detail-columns, .category-browser-layout, .detail-summary-grid, .variant-editor-layout, .variant-master-layout, .variant-form-row, .variant-form-row--wide, .variant-form-row--compact, .variant-price-form-grid, .variant-technical-form-grid, .category-form-row, .category-form-row--compact, .translation-row, .translation-overview-grid, .translation-technical-form-grid, .crawler-source-grid, .crawler-options-grid, .crawler-result-grid, .unified-enrichment-grid { grid-template-columns: 1fr; } .page-header { display: grid; } .sidebar-shell { position: static; } .page-body-collapsed { grid-template-columns: 1fr; } .crawler-modal-header { display: grid; } .crawler-field-wide { grid-column: auto; } }
         </style>
       </head>
       <body>
@@ -14013,6 +16519,7 @@ def configure_dash_app(app: Dash) -> Dash:
 
 app = configure_dash_app(create_dash_app())
 server = app.server
+enable_response_compression(server)
 
 
 def main() -> None:

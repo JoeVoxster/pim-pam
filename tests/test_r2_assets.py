@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
 from app.services.r2_config_service import effective_r2_settings, save_r2_config, serialize_r2_config
-from app.services.asset_service import build_r2_object_key, create_asset_record, upload_r2_asset_from_bytes, upload_selected_assets_to_r2
+from app.services.asset_service import build_r2_object_key, create_asset_record, detect_asset_language, update_asset_metadata, upload_r2_asset_from_bytes, upload_selected_assets_to_r2
 from app.services.r2_storage_service import BunnyStorage, R2Settings
 
 
@@ -78,6 +78,41 @@ def test_upload_r2_asset_from_bytes_saves_metadata(tmp_path) -> None:
     assert asset.status == "uploaded"
     assert fake_storage.uploaded[0]["object_key"] == asset.object_key
     assert any("Upload zu cloudflare_r2 erfolgreich" in row["message"] for row in log)
+
+
+def test_local_asset_record_stores_and_updates_language_code(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+    source = tmp_path / "sdb.pdf"
+    source.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    with SessionLocal() as session:
+        asset = create_asset_record(session, source, language_code="de-CH")
+        update_asset_metadata(
+            session,
+            asset.id,
+            title="Sicherheitsdatenblatt",
+            asset_type="safety_data_sheet",
+            language_code="fr",
+            status="active",
+        )
+        session.commit()
+
+    assert asset.language_code == "fr"
+    assert asset.title == "Sicherheitsdatenblatt"
+    assert asset.asset_type == "safety_data_sheet"
+
+
+def test_detect_asset_language_prefers_pdf_text_over_misleading_filename() -> None:
+    assert (
+        detect_asset_language(
+            filename="tintolav-d2-sds-it.pdf",
+            mime_type="application/pdf",
+            extracted_text="SAFETY DATA SHEET\nSECTION 1. Identification\nDetails of the supplier\nUses advised against",
+        )
+        == "en"
+    )
 
 
 def test_upload_r2_asset_rejects_executable(tmp_path) -> None:

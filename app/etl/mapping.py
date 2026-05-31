@@ -7,7 +7,7 @@ from slugify import slugify
 
 from app.models import ProductOutputRow
 from app.schemas.pim import ImportMappingConfig
-from app.utils.product_family import infer_family_data
+from app.utils.variant_options import infer_variant_option_data
 
 
 def category_values(product: ProductOutputRow, config: ImportMappingConfig) -> list[str]:
@@ -24,7 +24,7 @@ def category_values(product: ProductOutputRow, config: ImportMappingConfig) -> l
 
 def product_payload(product: ProductOutputRow) -> dict[str, object]:
     title = product.product_name or product.product_title or product.title_raw or product.supplier_sku
-    family = infer_family_data(
+    variant_options = infer_variant_option_data(
         sku=product.supplier_sku,
         title=title,
         variant_title=product.variant_title,
@@ -32,11 +32,10 @@ def product_payload(product: ProductOutputRow) -> dict[str, object]:
         existing_option_name=product.variant_option_1_name,
         existing_option_value=product.variant_option_1_value,
     )
-    product_sku = family.family_key or product.supplier_sku
-    product_title = family.family_title or title
+    product_sku = product.supplier_sku
+    product_title = variant_options.product_title or title
     payload = {
         "sku": product_sku,
-        "family_key": family.family_key,
         "handle": slugify(product_title, separator="-"),
         "source_language": _infer_source_language(product),
         "title": product_title,
@@ -76,7 +75,7 @@ def product_short_description(product: ProductOutputRow) -> str | None:
 
 def variant_payload(product: ProductOutputRow, config: ImportMappingConfig) -> dict[str, object]:
     extra_fields = product.extra_fields or {}
-    family = infer_family_data(
+    variant_options = infer_variant_option_data(
         sku=product.variant_sku or product.supplier_sku,
         title=product.product_name or product.product_title or product.title_raw or product.supplier_sku,
         variant_title=product.variant_title,
@@ -104,9 +103,9 @@ def variant_payload(product: ProductOutputRow, config: ImportMappingConfig) -> d
     return {
         "sku": product.variant_sku or product.supplier_sku,
         "variant_title": product.variant_title or product.product_title or product.product_name,
-        "option_name": family.option_name or product.variant_option_1_name,
-        "option_value": family.option_value or product.variant_option_1_value,
-        "packaging": family.option_value if family.option_name == "Packaging" else product.variant_option_1_value,
+        "option_name": variant_options.option_name or product.variant_option_1_name,
+        "option_value": variant_options.option_value or product.variant_option_1_value,
+        "packaging": variant_options.option_value if variant_options.option_name == "Packaging" else product.variant_option_1_value,
         "price": price,
         "currency": currency,
         "cost_price": purchase_price,

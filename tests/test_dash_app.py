@@ -1,11 +1,20 @@
 import base64
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.db.models import Base
+from app.schemas.pim import ProductCreate, VariantCreate
+from app.services.pim_service import create_product, get_product_detail
 from app.ui.dash_app import (
+    ProcessStatusPanel,
     _channel_bulk_category_dropdown_state,
     _category_id_from_grid_state,
     _dedupe_group_selection_state,
     _dedupe_select_group_rows,
+    _grid_cell_change,
     _reordered_product_ids_for_drop,
+    _save_product_grid_row,
     create_dash_app,
     save_uploaded_import_file,
 )
@@ -34,6 +43,80 @@ def test_save_uploaded_import_file_rejects_unknown_suffix(tmp_path, monkeypatch)
         raise AssertionError("Expected ValueError for unsupported suffix")
 
 
+def test_save_product_grid_row_uses_changed_brand_value(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pim.db'}", future=True)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+    with SessionLocal() as session:
+        product, _variant = create_product(
+            session,
+            ProductCreate(sku="BRAND-1", title="Brand Product", brand_name="Alt", status="draft"),
+            VariantCreate(sku="BRAND-1.01", variant_title="Default"),
+        )
+        _save_product_grid_row(
+            session,
+            {"id": product.id, "sku": "BRAND-1", "title": "Brand Product", "brand": "Alt", "status": "draft", "source_language": "en"},
+            changed_field="brand",
+            changed_value="Gmöhling",
+        )
+        session.commit()
+        detail = get_product_detail(session, product.id)
+
+    assert detail["brand_name"] == "Gmöhling"
+
+
+def test_grid_cell_change_accepts_dash_ag_grid_event_shapes() -> None:
+    assert _grid_cell_change({"colId": "brand", "newValue": "Gmöhling"}) == ("brand", "Gmöhling")
+    assert _grid_cell_change({"field": "brand", "value": "Gmöhling"}) == ("brand", "Gmöhling")
+    assert _grid_cell_change({"colDef": {"field": "brand"}, "new_value": "Gmöhling"}) == ("brand", "Gmöhling")
+
+
+def test_process_status_panel_visibility_and_details() -> None:
+    assert repr(ProcessStatusPanel({"status": "ready"})) == "Div(None)"
+
+    running = ProcessStatusPanel(
+        {
+            "process_id": "run-1",
+            "status": "running",
+            "process_name": "Produktdaten ergänzen",
+            "progress_current": 2,
+            "progress_total": 10,
+            "counters": {"products_checked": 2, "field_suggestions": 6},
+            "last_messages": ["gestartet"],
+        },
+        {"expanded": False, "log_visible": False},
+    )
+    running_repr = repr(running)
+    assert "process-status-panel-running" in running_repr
+    assert "Produktdaten ergänzen" in running_repr
+    assert "Geprüft: 2" in running_repr
+    assert "Vorschläge: 6" in running_repr
+    assert "Details anzeigen" in running_repr
+    assert "Prozess-Log anzeigen" in running_repr
+
+    hidden = ProcessStatusPanel({"process_id": "done-1", "status": "success"}, {"hidden_process_id": "done-1"})
+    assert repr(hidden) == "Div(None)"
+
+    error = ProcessStatusPanel(
+        {
+            "process_id": "err-1",
+            "status": "error",
+            "process_name": "Import",
+            "started_at": "2026-05-25T12:00:00+00:00",
+            "finished_at": "2026-05-25T12:00:05+00:00",
+            "error_message": "Fehler",
+            "last_messages": ["Fehler"],
+        },
+        {"expanded": True, "log_visible": True},
+    )
+    error_repr = repr(error)
+    assert "process-status-panel-error" in error_repr
+    assert "Start" in error_repr
+    assert "Prozess-Log ausblenden" in error_repr
+    assert "Fehler" in error_repr
+
+
 def test_dash_app_contains_combined_enrichment_button() -> None:
     app = create_dash_app()
     layout_repr = repr(app.layout)
@@ -43,7 +126,6 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "selected-variant-ids" in layout_repr
     assert "product-channel-actions" in layout_repr
     assert "variant-channel-actions" in layout_repr
-    assert "variant-list-status-filter" in layout_repr
     assert "Ausgewählte Varianten archivieren" in layout_repr
     assert "variant-delete-confirm" in layout_repr
     assert "product-channel-include-variants" in layout_repr
@@ -102,8 +184,6 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "product-description" in layout_repr
     assert "product-source-url" in layout_repr
     assert "product-source-url-final" in layout_repr
-    assert "product-list-status-filter" in layout_repr
-    assert "Archivierte Produkte" in layout_repr
     assert "channel-export-run-button" in layout_repr
     assert "channel-export-code" in layout_repr
     assert "channel-export-result" in layout_repr
@@ -126,9 +206,11 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "product-translation-prompts-button" in layout_repr
     assert "product-data-enrichment-open-button" in layout_repr
     assert "Fehlende Produktdaten anreichern" in layout_repr
-    assert "product-asset-enrichment-run-button" in layout_repr
-    assert "Fehlende Produkt-Assets anreichern" in layout_repr
-    assert "product-asset-enrichment-status" in layout_repr
+    assert "product-data-enrichment-target-languages" in layout_repr
+    assert "product-asset-enrichment-direct-button" in layout_repr
+    assert "Produkt-Assets holen" in layout_repr
+    assert "product-asset-enrichment-run-button" not in layout_repr
+    assert "product-asset-enrichment-status" not in layout_repr
     assert "medusa-product-selection-mode" in layout_repr
     assert "Markierte Produkte aus Produktliste" in layout_repr
     assert "Nur Produkte ohne Medusa-ID" in layout_repr
@@ -140,10 +222,15 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "product-data-enrichment-modal" in layout_repr
     assert "product-data-enrichment-suggestions-grid" in layout_repr
     assert "product-is-chemical" in layout_repr
+    assert "product-brand-options" in layout_repr
+    assert "product-detail-dirty-state" in layout_repr
+    assert "product-detail-original-values" in layout_repr
     assert "product-detail-variant-archive-button" in layout_repr
     assert "product-detail-variant-delete-button" in layout_repr
     assert "product-detail-variant-delete-confirm" in layout_repr
     assert "product-detail-variant-status-filter" in layout_repr
+    assert "product-detail-tier-delete-selected-button" in layout_repr
+    assert "variant-tier-delete-selected-button" in layout_repr
     assert "rules-product-enrichment-preview-button" in layout_repr
     assert "rules-product-enrichment-suggestions-grid" in layout_repr
     assert "Alle sicheren Vorschläge übernehmen" in layout_repr
@@ -152,6 +239,22 @@ def test_dash_app_contains_combined_enrichment_button() -> None:
     assert "languages-grid" in layout_repr
     assert "variant-translation-variant-id" in layout_repr
     assert "variant-translation-save-button" in layout_repr
+    assert "variant-detail-tabs" in layout_repr
+    assert "variant-selection-save-button" in layout_repr
+    assert "Variante speichern" in layout_repr
+    assert "variant-master-data" in layout_repr
+    assert "variant-prices" in layout_repr
+    assert "variant-customs" in layout_repr
+    assert "variant-assets" in layout_repr
+    assert "variant-detail-assets" in layout_repr
+    assert "variant-asset-upload" in layout_repr
+    assert "variant-asset-move-up-button" in layout_repr
+    assert "variant-asset-delete-button" in layout_repr
+    assert "Zoll / Compliance" in layout_repr
+    assert "variant-ch-tariff-code" in layout_repr
+    assert "variant-eu-taric-code" in layout_repr
+    assert "variant-customs-codes-grid" in layout_repr
+    assert "variant-customs-code-flow" in layout_repr
     assert "selected-asset-ids" in layout_repr
     assert "assets-bulk-actions" in layout_repr
     assert "assets-bulk-delete-confirm" in layout_repr

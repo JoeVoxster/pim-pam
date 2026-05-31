@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Asset
+from app.pdf.parser import extract_pdf_text
 from app.schemas.pim import AssetCreate
 from app.services.r2_storage_service import BunnyStorage, CloudflareR2Storage, remote_object_key_to_storage_path
 
@@ -45,6 +46,54 @@ ASSET_TYPE_FOLDERS = {
     "invoice_pdf": "invoices",
     "import_file": "imports",
     "other": "other",
+}
+_UNSET = object()
+SUPPORTED_ASSET_LANGUAGES = {
+    "de-ch": "de-CH",
+    "de-de": "de-DE",
+    "fr-ch": "fr-CH",
+    "it-ch": "it-CH",
+    "en-gb": "en-GB",
+    "en-us": "en-US",
+    "de": "de",
+    "fr": "fr",
+    "it": "it",
+    "en": "en",
+}
+LANGUAGE_TEXT_MARKERS = {
+    "en": (
+        "safety data sheet",
+        "product description",
+        "how to use",
+        "section",
+        "issued on",
+        "uses advised against",
+        "details of the supplier",
+    ),
+    "de": (
+        "sicherheitsdatenblatt",
+        "produktbeschreibung",
+        "anwendung",
+        "abschnitt",
+        "ausgestellt am",
+        "lieferant",
+    ),
+    "fr": (
+        "fiche de donnees de securite",
+        "fiche de données de sécurité",
+        "description du produit",
+        "mode d'emploi",
+        "rubrique",
+        "fournisseur",
+    ),
+    "it": (
+        "scheda di sicurezza",
+        "descrizione prodotto",
+        "modalita d'uso",
+        "modalità d'uso",
+        "sezione",
+        "fornitore",
+    ),
 }
 
 
@@ -82,6 +131,7 @@ def create_asset_record(
     variant_id: int | None = None,
     alt_text: str | None = None,
     source_url: str | None = None,
+    language_code: str | None = None,
 ) -> Asset:
     path = Path(file_path)
     stat = path.stat()
@@ -123,7 +173,60 @@ def create_asset_record(
     asset.storage_provider = "local"
     asset.status = "active"
     asset.uploaded_at = datetime.now(timezone.utc)
+    asset.language_code = _normalize_optional_text(language_code) or detect_asset_language(
+        path,
+        mime_type=mime_type,
+        filename=path.name,
+        source_url=source_url,
+    )
     session.add(asset)
+    session.flush()
+    return asset
+
+
+def detect_asset_language(
+    file_path: str | Path | None = None,
+    *,
+    mime_type: str | None = None,
+    filename: str | None = None,
+    source_url: str | None = None,
+    title: str | None = None,
+    extracted_text: str | None = None,
+) -> str | None:
+    text = extracted_text
+    path = Path(file_path) if file_path else None
+    effective_mime = (mime_type or (mimetypes.guess_type(str(path or filename or ""))[0] or "")).lower()
+    if text is None and path is not None and effective_mime == "application/pdf":
+        try:
+            text = extract_pdf_text(path)
+        except Exception:
+            text = None
+    detected_from_text = _detect_language_from_text(text)
+    if detected_from_text:
+        return detected_from_text
+    return _detect_language_from_hints(filename, source_url, title)
+
+
+def update_asset_metadata(
+    session: Session,
+    asset_id: int,
+    *,
+    title: object = _UNSET,
+    asset_type: object = _UNSET,
+    language_code: object = _UNSET,
+    status: object = _UNSET,
+) -> Asset:
+    asset = session.get(Asset, int(asset_id))
+    if asset is None:
+        raise ValueError(f"Asset {asset_id} nicht gefunden.")
+    if title is not _UNSET:
+        asset.title = _normalize_optional_text(title)
+    if asset_type is not _UNSET:
+        asset.asset_type = _normalize_optional_text(asset_type)
+    if language_code is not _UNSET:
+        asset.language_code = _normalize_optional_text(language_code)
+    if status is not _UNSET:
+        asset.status = _normalize_optional_text(status) or "active"
     session.flush()
     return asset
 
@@ -457,6 +560,62 @@ def _allowed_extensions_from_config(value: str | None) -> set[str]:
 
 def _metadata_value(value: str | None) -> str:
     return str(value or "")[:1024]
+
+
+def _normalize_optional_text(value: str | None) -> str | None:
+    cleaned = str(value or "").strip()
+    return cleaned or None
+
+
+def _detect_language_from_text(text: str | None) -> str | None:
+    normalized = _normalize_language_haystack(text)
+    if not normalized:
+        return None
+    scores = {
+        language: sum(1 for marker in markers if marker in normalized)
+        for language, markers in LANGUAGE_TEXT_MARKERS.items()
+    }
+    language, score = max(scores.items(), key=lambda item: item[1])
+    return language if score >= 2 else None
+
+
+def _detect_language_from_hints(*hints: str | None) -> str | None:
+    normalized = _normalize_language_haystack(" ".join(str(hint or "") for hint in hints))
+    if not normalized:
+        return None
+    for key, value in sorted(SUPPORTED_ASSET_LANGUAGES.items(), key=lambda item: len(item[0]), reverse=True):
+        normalized_key = _normalize_language_haystack(key)
+        if re.search(rf"(^|[^a-z]){re.escape(normalized_key)}([^a-z]|$)", normalized):
+            return value
+    language_words = (
+        ("de", ("deutsch", "german", "sicherheitsdatenblatt")),
+        ("fr", ("francais", "français", "french", "fiche de donnees", "fiche de données")),
+        ("it", ("italiano", "italian", "scheda di sicurezza")),
+        ("en", ("english", "safety data sheet", "product description")),
+    )
+    for code, tokens in language_words:
+        if any(token in normalized for token in tokens):
+            return code
+    return None
+
+
+def _normalize_language_haystack(value: str | None) -> str:
+    normalized = str(value or "").lower()
+    normalized = (
+        normalized.replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+        .replace("é", "e")
+        .replace("è", "e")
+        .replace("ê", "e")
+        .replace("à", "a")
+        .replace("ç", "c")
+        .replace("ì", "i")
+        .replace("ò", "o")
+        .replace("ù", "u")
+    )
+    return re.sub(r"[_./\\-]+", " ", normalized)
 
 
 def _image_size_from_bytes(payload: bytes, mime_type: str) -> tuple[int | None, int | None]:

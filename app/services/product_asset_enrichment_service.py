@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db.models import Asset, Product, ProductAssetCandidate
-from app.services.asset_service import create_asset_record
+from app.services.asset_service import create_asset_record, detect_asset_language
 from app.suppliers.base import SupplierAssetCandidate
 from app.suppliers.tintolav import SupplierExtractor as TintolavExtractor
 
@@ -258,7 +258,18 @@ def _save_discovery(
     asset.asset_type = asset_type
     asset.title = discovery.title or _title_for_asset_type(asset_type)
     asset.description = f"Automatisch über Produkt-Asset-Anreicherung gefunden. Quelle: {discovery.source_url or discovery.asset_url}"
-    asset.language_code = canonical_pdf_language(discovery.language_code or detect_pdf_language(discovery.asset_url, discovery.filename, discovery.title)) if _is_document_type(asset_type) else None
+    asset.language_code = (
+        detect_asset_language(
+            target,
+            mime_type=mime_type,
+            filename=target.name,
+            source_url=discovery.asset_url,
+            title=discovery.title,
+        )
+        or canonical_pdf_language(discovery.language_code or detect_pdf_language(discovery.asset_url, discovery.filename, discovery.title))
+        if _is_document_type(asset_type)
+        else None
+    )
     asset.checksum = checksum
     candidate.status = "downloaded"
     candidate.filename = target.name
@@ -337,21 +348,23 @@ def _discover_local_supplier_asset_mapping(product: Product) -> list[AssetDiscov
 
 
 def _discovery_from_supplier_item(product: Product, source_url: str, item: SupplierAssetCandidate, confidence: float) -> AssetDiscovery:
-    asset_type = _normalize_supplier_asset_type(item.asset_type or item.role or "unknown", item.asset_url, item.title)
+    asset_url = _preferred_asset_url(item.asset_url)
+    asset_type = _normalize_supplier_asset_type(item.asset_type or item.role or "unknown", asset_url, item.title)
     language = item.language if _is_document_type(asset_type) else None
     return AssetDiscovery(
         product_id=product.id,
-        asset_url=item.asset_url,
+        asset_url=asset_url,
         source_url=source_url,
         asset_type=asset_type,
         title=item.title,
-        filename=item.filename,
+        filename=item.filename or Path(urlparse(asset_url).path).name,
         language_code=language,
         confidence=confidence,
     )
 
 
 def _discovery_from_url(product: Product, asset_url: str, source_url: str | None, title: str | None, filename: str | None, confidence: float) -> AssetDiscovery:
+    asset_url = _preferred_asset_url(asset_url)
     asset_type = classify_asset_type(asset_url, title=title, context=filename)
     return AssetDiscovery(
         product_id=product.id,
@@ -359,7 +372,7 @@ def _discovery_from_url(product: Product, asset_url: str, source_url: str | None
         source_url=source_url,
         asset_type=asset_type,
         title=title,
-        filename=filename,
+        filename=filename or Path(urlparse(asset_url).path).name,
         language_code=detect_pdf_language(asset_url, filename, title) if _is_document_type(asset_type) else None,
         confidence=confidence,
     )
@@ -418,7 +431,7 @@ def _resolve_asset_download_dir(storage_root: Path, product_id: int, folder: str
 
 def _product_match_tokens(product: Product) -> set[str]:
     tokens: set[str] = set()
-    for value in [product.sku, product.family_key, *(variant.sku for variant in product.variants or [])]:
+    for value in [product.sku, *(variant.sku for variant in product.variants or [])]:
         raw = (value or "").strip().lower()
         if not raw:
             continue
@@ -475,11 +488,11 @@ def _rejected_image_url_reason(url: str) -> str | None:
     normalized = (url or "").lower()
     path = urlparse(url or "").path.lower()
     filename = Path(path).name
-    if "/thumbnail/" in normalized or re.search(r"/thumbnail/\d+x(?:/|$)", normalized):
+    if "/thumbnail/" in normalized or "/thumbnails/" in normalized or re.search(r"/thumbnails?/\d+x(?:/|$)", normalized):
         return "Thumbnail-Bild übersprungen."
     if any(token in normalized for token in ("/skin/", "/frontend/", "/static/", "/theme/", "/template/")):
         return "Layout-/Theme-Bild übersprungen."
-    if any(token in filename for token in ("sprite", "logo", "icon", "placeholder", "blank", "menu")):
+    if re.search(r"(^|[^a-z0-9])(sprite|logo|icon|placeholder|blank|menu)([^a-z0-9]|$)", filename):
         return "Nicht-produktbezogenes Layoutbild übersprungen."
     return None
 
@@ -593,15 +606,101 @@ def _unique_path(path: Path) -> Path:
 
 
 def _dedupe_discoveries(discoveries: list[AssetDiscovery]) -> list[AssetDiscovery]:
-    seen: set[str] = set()
-    output: list[AssetDiscovery] = []
+    best_by_key: dict[str, AssetDiscovery] = {}
+    order: list[str] = []
     for discovery in discoveries:
-        normalized = discovery.asset_url.strip()
-        if not normalized or normalized in seen:
+        normalized = _preferred_asset_url(discovery.asset_url.strip())
+        if not normalized:
             continue
-        seen.add(normalized)
-        output.append(discovery)
-    return output
+        if normalized != discovery.asset_url:
+            discovery = AssetDiscovery(
+                product_id=discovery.product_id,
+                asset_url=normalized,
+                source_url=discovery.source_url,
+                asset_type=classify_asset_type(normalized, title=discovery.title, context=discovery.filename) or discovery.asset_type,
+                title=discovery.title,
+                filename=discovery.filename or Path(urlparse(normalized).path).name,
+                language_code=discovery.language_code,
+                confidence=discovery.confidence,
+            )
+        key = _asset_candidate_key(discovery)
+        current = best_by_key.get(key)
+        if current is None:
+            best_by_key[key] = discovery
+            order.append(key)
+            continue
+        if _asset_candidate_score(discovery) > _asset_candidate_score(current):
+            best_by_key[key] = discovery
+    return [best_by_key[key] for key in order]
+
+
+def _preferred_asset_url(url: str) -> str:
+    asset_type = classify_asset_type(url)
+    if _is_image_type(asset_type):
+        return _preferred_image_url(url)
+    return url
+
+
+def _preferred_image_url(url: str) -> str:
+    parsed = urlparse(url or "")
+    path = parsed.path
+    if not path:
+        return url
+    preferred_path = re.sub(
+        r"(?i)(/images/dacshop/upload)/thumbnails/[^/]+/([^/]+)$",
+        r"\1/\2",
+        path,
+    )
+    if preferred_path == path:
+        return url
+    return parsed._replace(path=preferred_path, query="", fragment="").geturl()
+
+
+def _asset_candidate_key(discovery: AssetDiscovery) -> str:
+    url = _preferred_asset_url(discovery.asset_url)
+    asset_type = discovery.asset_type or classify_asset_type(url)
+    parsed = urlparse(url)
+    path = unquote(parsed.path or "").lower()
+    if _is_image_type(asset_type):
+        basename = Path(path).name
+        if basename:
+            return f"image:{parsed.netloc.lower()}:{basename}"
+    return f"{asset_type}:{parsed.netloc.lower()}:{path}"
+
+
+def _asset_candidate_score(discovery: AssetDiscovery) -> float:
+    url = _preferred_asset_url(discovery.asset_url)
+    asset_type = discovery.asset_type or classify_asset_type(url)
+    score = float(discovery.confidence or 0) * 100
+    if not _is_image_type(asset_type):
+        return score
+    normalized = url.lower()
+    if "/thumbnails/" in normalized or "/thumbnail/" in normalized:
+        score -= 500
+    if "/images/dacshop/upload/" in normalized and "/thumbnails/" not in normalized:
+        score += 300
+    dimensions = _dimensions_from_url(url)
+    if dimensions:
+        width, height = dimensions
+        score += min(width * height / 1000, 1000)
+    return score
+
+
+def _dimensions_from_url(url: str) -> tuple[int, int] | None:
+    match = re.search(r"(?<!\d)(\d{2,5})x(\d{2,5})(?:[a-z])?(?!\d)", url, flags=re.I)
+    if match:
+        try:
+            return int(match.group(1)), int(match.group(2))
+        except Exception:
+            return None
+    match = re.search(r"(?<!\d)(\d{2,5})x(?:[a-z])?(?=/|_|-|$)", url, flags=re.I)
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+        return value, value
+    except Exception:
+        return None
 
 
 def _unique_ints(values: list[int]) -> list[int]:

@@ -287,7 +287,7 @@ def test_write_medusa_products_uses_only_allowed_headers(tmp_path: Path) -> None
     assert frame.loc[0, "Variant Metadata"] == '{"variant": "SKU-1"}'
 
 
-def test_write_medusa_products_groups_color_family_rows_under_one_handle(tmp_path: Path) -> None:
+def test_write_medusa_products_exports_color_variant_options_without_group_key(tmp_path: Path) -> None:
     path = write_medusa_products(
         tmp_path,
         [
@@ -315,7 +315,7 @@ def test_write_medusa_products_groups_color_family_rows_under_one_handle(tmp_pat
     frame = pd.read_csv(path)
 
     assert len(frame) == 2
-    assert set(frame["Product Handle"]) == {"marking-tape-rolls-24-mm-6-pz"}
+    assert set(frame["Product Handle"]) == {"marking-tape-rolls-24-mm-orange-6-pz", "marking-tape-rolls-24-mm-blue-6-pz"}
     assert set(frame["Variant Option 1 Name"]) == {"Color"}
     assert set(frame["Variant Option 1 Value"]) == {"Orange", "Blue"}
 
@@ -352,10 +352,8 @@ def test_write_odoo_products_exports_template_and_variant_attribute_rows(tmp_pat
     templates = pd.read_csv(template_path)
     variants = pd.read_csv(variant_path)
 
-    assert len(templates) == 1
-    assert templates.loc[0, "Template External ID"] == "B01-045XX"
-    assert templates.loc[0, "Attribute 1 Name"] == "Color"
-    assert "Orange" in templates.loc[0, "Attribute 1 Values"]
-    assert "Blue" in templates.loc[0, "Attribute 1 Values"]
+    assert len(templates) == 2
+    assert set(templates["Template External ID"]) == {"B01-045AR", "B01-045AZ"}
+    assert set(templates["Attribute 1 Name"]) == {"Color"}
     assert len(variants) == 2
     assert set(variants["Attribute 1 Value"]) == {"Orange", "Blue"}

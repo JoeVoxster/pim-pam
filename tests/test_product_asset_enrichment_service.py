@@ -13,10 +13,14 @@ from app.db.models import Asset
 from app.schemas.pim import ProductCreate, VariantCreate
 from app.services.pim_service import create_product
 from app.services.product_asset_enrichment_service import (
+    AssetDiscovery,
+    _dedupe_discoveries,
+    _preferred_image_url,
+    _rejected_image_url_reason,
+    _resolve_asset_download_dir,
     build_asset_filename,
     detect_pdf_language,
     enrich_missing_product_assets,
-    _resolve_asset_download_dir,
 )
 
 
@@ -259,6 +263,43 @@ def test_resolve_asset_download_dir_uses_fallback_when_product_dir_not_writable(
 
     assert resolved == tmp_path / "_imports" / "product-16" / "images"
     assert resolved.exists()
+
+
+def test_preferred_image_url_replaces_tintolav_thumbnail_with_original() -> None:
+    url = "https://tintolav.com/images/dacshop/upload/thumbnails/350x350f/a15-040ad2_500ml.png"
+
+    assert _preferred_image_url(url) == "https://tintolav.com/images/dacshop/upload/a15-040ad2_500ml.png"
+
+
+def test_rejected_image_url_reason_does_not_reject_silicone_product_image() -> None:
+    assert _rejected_image_url_reason("https://tintolav.com/images/dacshop/upload/b13-002tubo_vapore_silicone.png") is None
+    assert _rejected_image_url_reason("https://tintolav.com/images/logos/linkedin_icon.png") == (
+        "Nicht-produktbezogenes Layoutbild übersprungen."
+    )
+
+
+def test_dedupe_discoveries_prefers_larger_image_candidate_for_same_file() -> None:
+    discoveries = [
+        AssetDiscovery(
+            product_id=17,
+            asset_url="https://www.voxster.ch/media/catalog/product/cache/2/image/364x/d/2/d2-rost-fleckenentferner.jpg",
+            source_url="https://www.voxster.ch/d2-rost-fleckenentferner",
+            asset_type="product_image",
+            confidence=0.58,
+        ),
+        AssetDiscovery(
+            product_id=17,
+            asset_url="https://www.voxster.ch/media/catalog/product/cache/2/image/650x/d/2/d2-rost-fleckenentferner.jpg",
+            source_url="https://www.voxster.ch/d2-rost-fleckenentferner",
+            asset_type="product_image",
+            confidence=0.58,
+        ),
+    ]
+
+    result = _dedupe_discoveries(discoveries)
+
+    assert len(result) == 1
+    assert "/650x/" in result[0].asset_url
 
 
 def _png_payload(width: int, height: int) -> bytes:

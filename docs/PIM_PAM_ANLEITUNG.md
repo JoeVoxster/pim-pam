@@ -84,7 +84,6 @@ Wichtige Spalten:
 - Titel
 - Foto / Asset
 - Sprache / Originalsprache
-- Family Key
 - Variantenwerte
 - Brand / Marke
 - Status
@@ -884,7 +883,6 @@ Produktive Shopdaten sollen über PIM/PAM synchronisiert werden, nicht manuell i
 ### F
 
 - Final URL: bevorzugte Produkt-Quellseite für Beschreibung/Anreicherung.
-- Family Key: Gruppierungsschlüssel für Produktfamilien.
 
 ### G
 

@@ -10,7 +10,7 @@ import pandas as pd
 from slugify import slugify
 
 from app.models import DownloadedAsset, ErrorRecord, ProductOutputRow
-from app.utils.product_family import infer_family_data
+from app.utils.variant_options import infer_variant_option_data
 
 DEFAULT_EXPORTS = {
     "products_clean_csv",
@@ -303,7 +303,7 @@ def write_odoo_products(output_dir: str | Path, products: Iterable[ProductOutput
 
 def _to_medusa_row(product: ProductOutputRow) -> dict[str, object]:
     image_urls = _split_pipe_values(product.image_urls)
-    family = infer_family_data(
+    variant_options = infer_variant_option_data(
         sku=product.variant_sku or product.supplier_sku,
         title=product.product_name or product.product_title or product.title_raw or product.supplier_sku,
         variant_title=product.variant_title,
@@ -311,14 +311,13 @@ def _to_medusa_row(product: ProductOutputRow) -> dict[str, object]:
         existing_option_name=product.variant_option_1_name,
         existing_option_value=product.variant_option_1_value,
     )
-    product_title = _normalize_export_text(family.family_title or product.product_name or product.product_title)
+    product_title = _normalize_export_text(variant_options.product_title or product.product_name or product.product_title)
     variant_title = _normalize_export_text(product.variant_title or product.product_title or product.product_name)
-    option_name = family.option_name or product.variant_option_1_name
-    option_value = family.option_value or product.variant_option_1_value
+    option_name = variant_options.option_name or product.variant_option_1_name
+    option_value = variant_options.option_value or product.variant_option_1_value
     custom_fields = _map_custom_medusa_fields(product.extra_fields or {})
     metadata = {
         "source_url": product.source_url_final or product.source_url,
-        "family_key": family.family_key,
         "supplier_sku": product.supplier_sku,
         "variant_sku": product.variant_sku,
         "datasheet_urls": _split_pipe_values(product.datasheet_urls),
@@ -352,7 +351,7 @@ def _to_medusa_row(product: ProductOutputRow) -> dict[str, object]:
 def _odoo_template_rows(products: list[ProductOutputRow]) -> list[dict[str, object]]:
     grouped: dict[str, list[ProductOutputRow]] = {}
     for product in products:
-        family = infer_family_data(
+        variant_options = infer_variant_option_data(
             sku=product.variant_sku or product.supplier_sku,
             title=product.product_name or product.product_title or product.title_raw or product.supplier_sku,
             variant_title=product.variant_title,
@@ -360,13 +359,13 @@ def _odoo_template_rows(products: list[ProductOutputRow]) -> list[dict[str, obje
             existing_option_name=product.variant_option_1_name,
             existing_option_value=product.variant_option_1_value,
         )
-        external_id = family.family_key or product.supplier_sku
+        external_id = product.supplier_sku
         grouped.setdefault(external_id, []).append(product)
 
     rows: list[dict[str, object]] = []
     for external_id, items in grouped.items():
         first = items[0]
-        family = infer_family_data(
+        variant_options = infer_variant_option_data(
             sku=first.variant_sku or first.supplier_sku,
             title=first.product_name or first.product_title or first.title_raw or first.supplier_sku,
             variant_title=first.variant_title,
@@ -376,7 +375,7 @@ def _odoo_template_rows(products: list[ProductOutputRow]) -> list[dict[str, obje
         )
         option_values = sorted(
             {
-                infer_family_data(
+                infer_variant_option_data(
                     sku=item.variant_sku or item.supplier_sku,
                     title=item.product_name or item.product_title or item.title_raw or item.supplier_sku,
                     variant_title=item.variant_title,
@@ -391,14 +390,14 @@ def _odoo_template_rows(products: list[ProductOutputRow]) -> list[dict[str, obje
         rows.append(
             {
                 "Template External ID": external_id,
-                "Name": family.family_title or first.product_name or first.product_title,
+                "Name": variant_options.product_title or first.product_name or first.product_title,
                 "Internal Reference": external_id,
                 "Brand": first.brand or first.supplier_name,
                 "Description": first.description,
                 "Sales Price": _odoo_price(first, "sales"),
                 "Cost Price": _odoo_price(first, "cost"),
                 "Currency": _odoo_currency(first),
-                "Attribute 1 Name": family.option_name,
+                "Attribute 1 Name": variant_options.option_name,
                 "Attribute 1 Values": ", ".join(option_values) if option_values else None,
                 "Source URL": first.source_url_final or first.source_url,
             }
@@ -409,7 +408,7 @@ def _odoo_template_rows(products: list[ProductOutputRow]) -> list[dict[str, obje
 def _odoo_variant_rows(products: list[ProductOutputRow]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for product in products:
-        family = infer_family_data(
+        variant_options = infer_variant_option_data(
             sku=product.variant_sku or product.supplier_sku,
             title=product.product_name or product.product_title or product.title_raw or product.supplier_sku,
             variant_title=product.variant_title,
@@ -419,11 +418,11 @@ def _odoo_variant_rows(products: list[ProductOutputRow]) -> list[dict[str, objec
         )
         rows.append(
             {
-                "Template External ID": family.family_key or product.supplier_sku,
+                "Template External ID": product.supplier_sku,
                 "Variant SKU": product.variant_sku or product.supplier_sku,
                 "Variant Name": product.variant_title or product.product_title or product.product_name,
-                "Attribute 1 Name": family.option_name,
-                "Attribute 1 Value": family.option_value or product.variant_option_1_value,
+                "Attribute 1 Name": variant_options.option_name,
+                "Attribute 1 Value": variant_options.option_value or product.variant_option_1_value,
                 "Barcode": product.barcode,
                 "EAN": product.ean,
                 "Sales Price": _odoo_price(product, "sales"),

@@ -27,7 +27,7 @@ def test_pim_mapping_builds_product_and_variant_payloads() -> None:
     assert asset_paths(product) == ["/tmp/a.png", "/tmp/b.png"]
 
 
-def test_pim_mapping_infers_family_key_and_color_option() -> None:
+def test_pim_mapping_keeps_product_sku_and_infers_color_option() -> None:
     product = ProductOutputRow(
         supplier_sku="B01-045AR",
         variant_sku="B01-045AR",
@@ -41,14 +41,13 @@ def test_pim_mapping_infers_family_key_and_color_option() -> None:
     payload = product_payload(product)
     variant = variant_payload(product, ImportMappingConfig())
 
-    assert payload["sku"] == "B01-045XX"
-    assert payload["family_key"] == "B01-045XX"
-    assert payload["title"] == "Marking Tape Rolls 24 mm. 6 pz."
+    assert payload["sku"] == "B01-045AR"
+    assert payload["title"] == "Marking Tape Rolls 24 mm. Orange 6 pz."
     assert variant["option_name"] == "Color"
     assert variant["option_value"] == "Orange"
 
 
-def test_pim_mapping_infers_color_from_tintolav_sku_suffix_without_forcing_family() -> None:
+def test_pim_mapping_infers_color_from_tintolav_sku_suffix() -> None:
     product = ProductOutputRow(
         supplier_sku="B10-056AZ",
         variant_sku="B10-056AZ",
@@ -62,7 +61,7 @@ def test_pim_mapping_infers_color_from_tintolav_sku_suffix_without_forcing_famil
     payload = product_payload(product)
     variant = variant_payload(product, ImportMappingConfig())
 
-    assert payload["family_key"] == "B10-056XX"
+    assert payload["sku"] == "B10-056AZ"
     assert variant["option_name"] == "Color"
     assert variant["option_value"] == "Blue"
 
@@ -81,9 +80,8 @@ def test_pim_mapping_prefers_packaging_over_color_words_for_weight_variants() ->
     payload = product_payload(product)
     variant = variant_payload(product, ImportMappingConfig())
 
-    assert payload["sku"] == "A39-512XX"
-    assert payload["family_key"] == "A39-512XX"
-    assert payload["title"] == "White Xtra Deodetergent Whites"
+    assert payload["sku"] == "A39-512K"
+    assert payload["title"] == "White Xtra 10 kg. Deodetergent Whites"
     assert variant["option_name"] == "Packaging"
     assert variant["option_value"] == "10 kg"
     assert variant["packaging"] == "10 kg"
